@@ -1,0 +1,25 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "python": "/home/zyk/anaconda3/envs/street-gaussian/bin/python",
+            "name": "Python Debugger: Current File",
+            "type": "python",
+            "request": "launch",
+            "cwd": "${workspaceFolder}",
+            "program": "test.py",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": {
+                "TORCH_SHOW_CPP_STACKTRACES": "1",
+                "CUDA_VISIBLE_DEVICES": "0",
+                "CUDA_LAUNCH_BLOCKING": "1",
+                "PWD": "${workspaceFolder}",
+            },
+            "args": []
+        }
+    ]
+}
