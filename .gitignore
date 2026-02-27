@@ -1,6 +1,5 @@
 output/
 data/*
-!data/
 notebooks/*
 **/__pycache__
 .vscode/
