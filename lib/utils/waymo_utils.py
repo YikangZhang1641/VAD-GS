@@ -329,33 +329,37 @@ def compute_sh_principal_direction(sh_coeffs):
     return principal_direction
     
 # Normal prior 可视化
-def my_vis(points_xyz_world, points_rgb, points_normal, coord_size=15):
+def my_vis(points_xyz_world, points_rgb, points_normal=None, coord_size=15):
     normal_lines = []
     line_colors = []
     # tmp = points_xyz_vehicle[mask_cam] @ ego_pose.T
     tmp = points_xyz_world[:,:3]
 
-    for j in range(tmp.shape[0]):
-        p1 = tmp[j]
-        p2 = tmp[j] + points_normal[j] * 0.2  # 放大法向量
-        normal_lines.append([p1, p2])
-        line_colors.append([1, 0, 0])  # 颜色（红色表示法向量）
-
-    line_set = o3d.geometry.LineSet()
-    line_set.points = o3d.utility.Vector3dVector(np.vstack(normal_lines))
-    line_set.lines = o3d.utility.Vector2iVector(np.arange(len(normal_lines) * 2).reshape(-1, 2))
-    line_set.colors = o3d.utility.Vector3dVector(np.array(line_colors))
-    
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(points_xyz_world[:,:3])                
     pcd.colors = o3d.utility.Vector3dVector(points_rgb)
     
+    viz_objs = [pcd]
+    if points_normal:
+        for j in range(tmp.shape[0]):
+            p1 = tmp[j]
+            p2 = tmp[j] + points_normal[j] * 0.2  # 放大法向量
+            normal_lines.append([p1, p2])
+            line_colors.append([1, 0, 0])  # 颜色（红色表示法向量）
+
+        line_set = o3d.geometry.LineSet()
+        line_set.points = o3d.utility.Vector3dVector(np.vstack(normal_lines))
+        line_set.lines = o3d.utility.Vector2iVector(np.arange(len(normal_lines) * 2).reshape(-1, 2))
+        line_set.colors = o3d.utility.Vector3dVector(np.array(line_colors))
+        viz_objs.append(line_set)
+
     if coord_size is None:
-        o3d.visualization.draw_geometries([pcd, line_set], point_show_normal=True)
+        o3d.visualization.draw_geometries(viz_objs, point_show_normal=True)
         return
 
     FOR1 = o3d.geometry.TriangleMesh.create_coordinate_frame(size=coord_size, origin=[0, 0, 0])
-    o3d.visualization.draw_geometries([pcd, line_set, FOR1], point_show_normal=True)
+    viz_objs.append(FOR1)
+    o3d.visualization.draw_geometries(viz_objs, point_show_normal=True)
 
 def create_custom_camera_visualization(
     view_width_px,
@@ -682,10 +686,6 @@ def generate_dataparser_outputs(
             
             raw_3d = pts3d_dict[frame]
             raw_2d = pts2d_dict[frame]
-            
-
-
-
 
 
             # use the first projection camera
@@ -707,11 +707,13 @@ def generate_dataparser_outputs(
             )
             points_xyz_world = points_xyz_vehicle @ ego_pose.T
             
-            points_rgb = np.ones_like(points_xyz_vehicle[:, :3])
+            points_rgb = np.zeros_like(points_xyz_vehicle[:, :3])
             points_normal = np.ones_like(points_xyz_vehicle[:, :3])
             # points_trackview = np.ones_like(points_xyz_vehicle[:, :1]).astype(np.int16) * -1
             points_visibility = np.zeros([points_xyz_vehicle.shape[0], N_VIEWS]).astype(np.bool_) 
 
+            # my_vis(points_xyz_vehicle, points_rgb, coord_size=3)
+            
             # points_camera = points_camera_all[mask]
             # points_projw = points_projw_all[mask]
             # points_projh = points_projh_all[mask]

@@ -16,6 +16,8 @@ from lib.utils.box_utils import bbox_to_corner3d, get_bound_2d_mask
 from lib.utils.img_utils import draw_3d_box_on_img
 from lib.utils.graphics_utils import project_numpy
 
+import time
+
 # castrack_path = '/nas/home/yanyunzhi/waymo/castrack/seq_infos/val/result.json'
 # with open(castrack_path, 'r') as f:
 #     castrack_infos = json.load(f)
@@ -614,6 +616,8 @@ def main():
     for i, scene_id in enumerate(scene_ids_list):
         assert seq_names[i][3:] == seq_lists[scene_id][8:14]
         seq_save_dir = os.path.join(save_dir, str(scene_id).zfill(3))
+
+        time_start=time.time()
         parse_seq_rawdata(
             process_list=process_list,
             root_dir=root_dir,
@@ -621,6 +625,8 @@ def main():
             seq_save_dir=seq_save_dir,
             track_file=track_file,
         )
-    
+        time_end=time.time()
+        print('scene id:', scene_id, ', time cost',time_end-time_start,'s')
+
 if __name__ == '__main__':
     main()

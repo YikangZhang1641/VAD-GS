@@ -1,6 +1,6 @@
-task: waymo_full_exp_origin
+task: cvpr_waymo021
 source_path: ./data/waymo/training/021
-exp_name: waymo_train_021_0714_3cam
+exp_name: cam0
 
 data:
   split_test: 4
@@ -8,7 +8,7 @@ data:
   type: Waymo
   white_background: false
   selected_frames: [0, 60] # 0, 198
-  cameras: [0, 1, 2]
+  cameras: [0]
   extent: 10
   use_colmap: true
   filter_colmap: true

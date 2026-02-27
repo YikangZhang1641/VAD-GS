@@ -18,6 +18,8 @@ from lib.utils.graphics_utils import project_numpy
 import glob
 import matplotlib.pyplot as plt
 
+import time
+
 # castrack_path = '/nas/home/yanyunzhi/waymo/castrack/seq_infos/val/result.json'
 # with open(castrack_path, 'r') as f:
 #     castrack_infos = json.load(f)
@@ -290,6 +292,7 @@ def main():
     #         track_file=track_file,
     #     )
 
+    time_start=time.time()
     parse_seq_rawdata(
         process_list=process_list,
         root_dir=root_dir,
@@ -297,6 +300,9 @@ def main():
         seq_save_dir=root_dir,
         track_file=track_file,
     )
+    
+    time_end=time.time()
+    print('time cost',time_end-time_start,'s')
 
 if __name__ == '__main__':
     main()
