@@ -1,6 +1,7 @@
 output/
 data/*
 notebooks/*
+.ipynb_checkpoints
 **/__pycache__
 .vscode/
 build/

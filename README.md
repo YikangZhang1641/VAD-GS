@@ -58,6 +58,18 @@ data/
 
 ### Example 
 - We provide an example scene [here](https://drive.google.com/file/d/1Qc3yK__WfjiZJ-5ursKcMbI3_iQYD4cc/view?usp=sharing). Download and extract it to the folder path above.
+
+For training:
 ```
 python train.py --config configs/example/nuscenes_train_000.yaml
+```
+
+To generate visual outputs:
+```
+python render.py --config configs/example/nuscenes_train_000.yaml mode evaluate
+```
+
+For evaluation:
+```
+python metrics.py --config configs/example/nuscenes_train_000.yaml
 ```
