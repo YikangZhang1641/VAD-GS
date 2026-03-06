@@ -1,7 +1,6 @@
-# VAD-GS: Visibility-Aware Densification for 3D Gaussian Splatting in Dynamic Urban Scenes
+# [CVPR 2026] VAD-GS: Visibility-Aware Densification for 3D Gaussian Splatting in Dynamic Urban Scenes
 
 
-### Example 
-```
-python train.py --config configs/example/nuscenes_train_001.yaml
-```
+[Project page](mias.group/VADGS) |  [paper](https://arxiv.org/abs/2510.09364)
+
+Code is being optimized. Checkout the dev branch.
