@@ -3,3 +3,6 @@ data/*
 notebooks/*
 **/__pycache__
 .vscode/
+build/
+*.so
+*.egg-info

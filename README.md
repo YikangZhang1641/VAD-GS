@@ -1,8 +1,8 @@
 # [CVPR 2026] VAD-GS: Visibility-Aware Densification for 3D Gaussian Splatting in Dynamic Urban Scenes
 
-### Requirements 
+<!-- ### Requirements 
 Torch version: 1.12.0+cu113
-
+ -->
 
 
 ### Installation
@@ -57,7 +57,7 @@ data/
 
 
 ### Example 
-- We provide an example scene [here](https://drive.google.com/file/d/1Qc3yK__WfjiZJ-5ursKcMbI3_iQYD4cc/view?usp=sharing). 
+- We provide an example scene [here](https://drive.google.com/file/d/1Qc3yK__WfjiZJ-5ursKcMbI3_iQYD4cc/view?usp=sharing). Download and extract it to the folder path above.
 ```
 python train.py --config configs/example/nuscenes_train_000.yaml
 ```
