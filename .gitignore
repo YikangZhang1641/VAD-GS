@@ -4,3 +4,6 @@ data/*
 notebooks/*
 **/__pycache__
 .vscode/
+build/
+*.egg-info/
+*.so
