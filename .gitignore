@@ -2,8 +2,9 @@ output/
 data/*
 notebooks/*
 .ipynb_checkpoints
-**/__pycache__
+**/__pycache__/
 .vscode/
 build/
 *.so
 *.egg-info
+log_gpy.py
