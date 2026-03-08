@@ -113,7 +113,7 @@ def run_colmap_waymo(result):
     
     # https://colmap.github.io/faq.html#mask-image-regions
     os.system(f'colmap feature_extractor \
-            --ImageReader.mask_path {new_mask_filename} \
+            --ImageReader.mask_path {mask_images_dir} \
             --ImageReader.camera_model SIMPLE_PINHOLE  \
             --ImageReader.single_camera_per_folder 1 \
             --database_path {colmap_dir}/database.db \
