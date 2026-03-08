@@ -7,7 +7,7 @@ plyfile
 tensorboard
 sympy
 numpy==1.23.5
-pillow
+pillow==9.5.0
 matplotlib
 bidict
 ipdb
