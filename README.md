@@ -16,7 +16,7 @@ git checkout -b dev origin/dev
 <details>
 <summary>Build tools</summary>
 
-1. Install [COLMAP](https://colmap.github.io/install.html)
+1. Install [COLMAP](https://colmap.github.io/install.html) (tested version 3.10-dev)
 2. Build SIBR_viewer following the tutorial of [3DGS](https://github.com/graphdeco-inria/gaussian-splatting)
 
 </details>
