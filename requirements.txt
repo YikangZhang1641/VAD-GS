@@ -22,6 +22,6 @@ imgviz
 protobuf==3.19
 termcolor
 segment_anything
-numba
-pynvml
-# git+https://github.com/NVlabs/nvdiffrast.git
+numba==0.58.1
+pynvml==11.5.3
+git+https://github.com/NVlabs/nvdiffrast.git
