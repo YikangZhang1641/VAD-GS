@@ -1,8 +1,6 @@
 # [CVPR 2026] VAD-GS: Visibility-Aware Densification for 3D Gaussian Splatting in Dynamic Urban Scenes
+[Project page](https://mias.group/VAD-GS/) |  [paper](https://arxiv.org/abs/2510.09364)
 
-<!-- ### Requirements 
-Torch version: 1.12.0+cu113
- -->
 
 
 ### Installation
@@ -14,7 +12,19 @@ git checkout -b dev origin/dev
 ```
 </details>
 
-<details> <summary>Set up the python environment</summary>
+
+<details>
+<summary>Build tools</summary>
+
+1. Install [COLMAP](https://colmap.github.io/install.html)
+2. Build SIBR_viewer following the tutorial of [3DGS](https://github.com/graphdeco-inria/gaussian-splatting)
+
+</details>
+
+
+
+
+<details> <summary>Set up the environment</summary>
 
 ```
 # Set conda environment
