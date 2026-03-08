@@ -1,23 +1,19 @@
-task: waymo_full_exp_origin
-# source_path: ./data/waymo/training/021
-# source_path: /home/zyk/Projects/_DL/_Reconstruction/drivestudio/data/waymo/processed/training/021
-source_path: /home/zyk/Projects/_DL/_Reconstruction/drivestudio/data/nuscenes/processed_10Hz/mini/001
-exp_name: 0621_ds_nuscenes01
+task: waymo_exp
+source_path: data/waymo/processed/training/021
+exp_name: waymo_train_021_3cam
 
 data:
-  split_test: 4
-  split_train: -1
+  split_test: -1
+  split_train: 1
   # type: Waymo
   type: DriveStudio
   white_background: false
-  # selected_frames: [0, 195] # 0, 198
-  # cameras: [0, 1, 2, 3, 4, 5]
   selected_frames: [0, 60] # 0, 198
-  cameras: [0, 1, 2, 3, 4]
+  cameras: [0, 1, 2]
   extent: 10
   use_colmap: true
   filter_colmap: true
-  box_scale: 1.0
+  box_scale: 1.5
   shuffle: false
 
 model:
@@ -36,13 +32,14 @@ model:
 
 
 train:
-  iterations: 30000
-  test_iterations: [8000, 16000, 30000]
-  save_iterations: [30000]
-  checkpoint_iterations: [4000, 8000, 16000, 24000, 30000]
+  iterations: 50000
+  test_iterations: [7000, 30000, 50000]
+  save_iterations: [50000]
+  checkpoint_iterations: [600, 1200, 2400, 4200, 50000]
 
 optim:
-
+  hard_depth_start: 0
+  soft_depth_start: 1000
   error_tolerance: 0.01
 
   prune_box_interval: 100
@@ -55,17 +52,13 @@ optim:
   densify_grad_abs_bkgd: True
   densify_grad_threshold_obj: 0.0002 #0.0002
   densify_grad_abs_obj: False
-  densify_until_iter: 24000
+  densify_until_iter: 25000
 
-########## visibility
-  hard_depth_start: 0
-  hard_depth_end: 24000
   propagated_iteration_begin: 0 # 1000
-  propagated_iteration_end: 24000
-  propagation_interval: 5
-  lambda_shape_pena: 0
-  lambda_scale_pena: 0
+  propagated_iteration_after: 10000
+  propagation_interval: 29
 
+  hard_depth_start: 0
 
   feature_lr: 0.0025
   max_screen_size: 20
@@ -77,7 +70,7 @@ optim:
   position_lr_delay_mult: 0.01
   position_lr_final: 1.6e-06
   position_lr_init: 1.6e-05 # 0.00016
-  position_lr_max_steps: 30000
+  position_lr_max_steps: 50000
   rotation_lr: 0.001
   scaling_lr: 0.005
   semantic_lr: 0.01
@@ -98,17 +91,7 @@ optim:
   track_rotation_lr_final: 1.0e-5
   track_rotation_max_steps: 30000
 
-  # voxel DN vision
-  normal_loss: True
-  use_voxel_depth: True
-  
-  # origin lidar depth supervision
-  use_lidar_depth: False
 
-  # view selection
-  skip_view_selection: False
-
-  
 render:
   fps: 24
   concat_cameras: [1, 0, 2]

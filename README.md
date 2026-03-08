@@ -6,7 +6,7 @@ Torch version: 1.12.0+cu113
 
 
 ### Installation
-<details> <summary>Clone this repository</summary>
+<details> <summary>Clone this repository and checkout dev branch</summary>
 
 ```
 git clone https://github.com/YikangZhang1641/VAD-GS.git
@@ -44,20 +44,23 @@ pip install ./submodules/MyPropagation
 ```
 data/
    ├── nuscenes/
-   │     ├── 000/
-   │     │     ├── images/
-   │     |     ├── ego_pose/
-   │     |     ├── lidar_depth/
-   │     |     └── ...
-   │     ├── 001/
-   │     ├── ...
+   │     ├── raw/
+   │     ├── processed_10Hz/
+   │     │     ├── mini/
+   │     │     │     ├── 000/
+   │     │     │     │     ├── images/
+   │     |     │     │     ├── ego_pose/
+   │     |     │     │     ├── lidar_depth/
+   │     |     │     │     └── ...
+   │     │     │     ├── 001/
+   │     │     │     ├── ...
    └── waymo/
          |...
    ```
 
 
 ### Example 
-- We provide an example scene [here](https://drive.google.com/file/d/1Qc3yK__WfjiZJ-5ursKcMbI3_iQYD4cc/view?usp=sharing). Download and extract it to the folder path above.
+- We provide a nuScenes example [here](https://drive.google.com/file/d/1Qc3yK__WfjiZJ-5ursKcMbI3_iQYD4cc/view?usp=sharing). Download and extract it to the folder path above.
 
 For training:
 ```

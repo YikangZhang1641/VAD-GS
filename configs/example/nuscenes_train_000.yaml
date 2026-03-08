@@ -1,8 +1,6 @@
-task: waymo_full_exp_origin
-# source_path: ./data/waymo/training/021
-# source_path: /home/zyk/Projects/_DL/_Reconstruction/drivestudio/data/waymo/processed/training/021
-source_path: /home/zyk/Projects/_DL/_Reconstruction/drivestudio/data/nuscenes/processed_10Hz/mini/000
-exp_name: 0622_ds_nuscenes00
+task: nuscenes_exp
+source_path: data/nuscenes/processed_10Hz/mini/000
+exp_name: nuscenes_val_000_5cam
 
 data:
   type: DriveStudio
