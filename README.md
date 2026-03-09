@@ -70,7 +70,7 @@ data/
 
 
 ### Example 
-- We provide a nuScenes example [here](https://drive.google.com/file/d/1Qc3yK__WfjiZJ-5ursKcMbI3_iQYD4cc/view?usp=sharing). Download and extract it to the folder path above.
+- We provide a nuScenes example [here](https://drive.google.com/file/d/1suOq_jm3hJt-HyWGTRyY8s58sbM2Z1uz/view?usp=sharing). Download and extract it to the folder path above.
 
 For training:
 ```
