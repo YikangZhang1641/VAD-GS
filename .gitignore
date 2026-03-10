@@ -1,9 +1,15 @@
 output/
 data/*
-!data/
 notebooks/*
-**/__pycache__
+.ipynb_checkpoints
+**/__pycache__/
 .vscode/
 build/
+<<<<<<< HEAD
 *.egg-info/
 *.so
+=======
+*.so
+*.egg-info
+log_gpy.py
+>>>>>>> dev

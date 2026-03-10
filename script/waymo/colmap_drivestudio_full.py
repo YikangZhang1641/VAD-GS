@@ -100,8 +100,11 @@ def run_colmap_waymo(result):
     for i, image_filename in enumerate(mask_image_filenames):
         basename = os.path.basename(image_filename)
         mask_images_dir = os.path.join(colmap_dir, 'mask')
-        new_image_filename = os.path.join(mask_images_dir, image_filename)
-        new_mask_filename = f'{new_image_filename}.png'
+        img_name = image_filename.split("/")[-1]
+        cam_id = image_filename.split("/")[-1].split("_")[-1].split(".")[0]       
+        # new_image_filename = os.path.join(mask_images_dir, "cam_"+cam_id, img_name)
+        # new_mask_filename = f'{new_image_filename}.png'
+        new_mask_filename = os.path.join(mask_images_dir, "cam_"+cam_id, img_name)
         if not os.path.exists(new_mask_filename):
             shutil.copyfile(image_filename, new_mask_filename)
             mask = cv2.imread(new_mask_filename)
