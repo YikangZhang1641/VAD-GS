@@ -5,11 +5,6 @@ notebooks/*
 **/__pycache__/
 .vscode/
 build/
-<<<<<<< HEAD
-*.egg-info/
-*.so
-=======
 *.so
 *.egg-info
 log_gpy.py
->>>>>>> dev
