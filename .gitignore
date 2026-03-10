@@ -7,4 +7,4 @@ notebooks/*
 build/
 *.so
 *.egg-info
-log_gpy.py
+log_gpu.py

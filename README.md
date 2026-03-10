@@ -3,7 +3,7 @@
 
 <div class="alert alert-info">
 <p align="center">
-  <img src="./assets/flowchart.png" alt="teaser" width="800" />
+  <img src="./assets/flowchart.png" alt="flowchart" width="800" />
 </p>
 </div>
 
