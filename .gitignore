@@ -8,3 +8,4 @@ build/
 *.so
 *.egg-info
 log_gpu.py
+make_ply.py
