@@ -1,5 +1,5 @@
 # [CVPR 2026] VAD-GS: Visibility-Aware Densification for 3D Gaussian Splatting in Dynamic Urban Scenes
-[Project page](https://mias.group/VAD-GS/) |  [paper](https://arxiv.org/abs/2510.09364)
+[Project page](https://mias.group/VAD-GS/) |  [Paper](https://arxiv.org/abs/2510.09364) | [Youtube](https://www.youtube.com/watch?v=vq7EhjpogY0) | [Bilibili](https://www.bilibili.com/video/BV131P5zXESN)
 
 <div class="alert alert-info">
 <p align="center">
