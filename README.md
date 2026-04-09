@@ -90,3 +90,18 @@ For evaluation:
 ```
 python metrics.py --config configs/example/nuscenes_train_000.yaml
 ```
+
+
+### Citation
+
+If you find this code useful for your research, please use the following BibTeX entry.
+
+```
+@inproceedings{zhang2025vadgs,
+    title={VAD-GS: Visibility-Aware Densification for 3D Gaussian Splatting in Dynamic Urban Scenes}, 
+    author={Yikang Zhang and Rui Fan},
+    booktitle={Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)},
+    pages={},
+    year={2026}
+}
+```
