@@ -1,6 +1,7 @@
 output/
 data/*
 notebooks/*
+!notebooks/waymo_converter.ipynb
 .ipynb_checkpoints
 **/__pycache__/
 .vscode/

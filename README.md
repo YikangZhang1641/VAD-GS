@@ -74,7 +74,9 @@ data/
 
 
 ### Example 
-- We provide a nuScenes example [here](https://drive.google.com/file/d/1suOq_jm3hJt-HyWGTRyY8s58sbM2Z1uz/view?usp=sharing). Download and extract it to the folder path above.
+- Our data processing follows [StreetGaussians](https://github.com/zju3dv/street_gaussians)(Waymo) and [DriveStudio](https://github.com/ziyc/drivestudio)(nuScenes). Other initial guesses are predicted via [DA v2](https://github.com/DepthAnything/Depth-Anything-V2), [DSINE](https://github.com/baegwangbin/DSINE) and [SAM](https://github.com/facebookresearch/segment-anything). 
+More details can be found in notebooks.
+- We also provide examples [here](https://drive.google.com/drive/folders/1zIrNXwiNq1szcktI8So8GDUGVhhJRn07?usp=drive_link). Download and extract it to the folder path above.
 
 For training:
 ```
