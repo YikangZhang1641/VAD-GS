@@ -1,6 +1,6 @@
 output/
 data/*
-notebooks/*
+notebooks/*.ipynb
 !notebooks/waymo_converter.ipynb
 .ipynb_checkpoints
 **/__pycache__/
