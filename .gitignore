@@ -3,10 +3,13 @@ data/*
 notebooks/*.ipynb
 !notebooks/waymo_converter.ipynb
 .ipynb_checkpoints
-**/__pycache__/
+**/__pycache__
 .vscode/
 build/
 *.so
 *.egg-info
 log_gpu.py
 make_ply.py
+*.pyc
+res/*
+res_bak/*
