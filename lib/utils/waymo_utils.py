@@ -37,6 +37,216 @@ image_widths = [1920, 1920, 1920, 1920, 1920]
 image_filename_to_cam = lambda x: int(x.split('.')[0][-1])
 image_filename_to_frame = lambda x: int(x.split('.')[0][:6])
 
+
+def _raw_pixels_to_vggt_pixels(x, y, source_width, source_height, target_width, target_height,
+                               pixel_transform=None):
+    """Mirror the crop/resize convention used by vggt-omega."""
+    if pixel_transform is None:
+        aspect_ratio = source_height / max(source_width, 1)
+        crop_left = crop_top = 0
+        crop_width, crop_height = source_width, source_height
+        if aspect_ratio < 0.5:
+            crop_width = min(source_width, max(1, int(round(source_height / 0.5))))
+            crop_left = max((source_width - crop_width) // 2, 0)
+        elif aspect_ratio > 2.0:
+            crop_height = min(source_height, max(1, int(round(source_width * 2.0))))
+            crop_top = max((source_height - crop_height) // 2, 0)
+        resized_width, resized_height = target_width, target_height
+        pad_left = pad_top = 0
+    else:
+        (crop_left, crop_top, crop_width, crop_height, resized_width,
+         resized_height, pad_left, pad_top) = np.asarray(pixel_transform, dtype=np.float64)
+
+    valid = ((x >= crop_left) & (x < crop_left + crop_width) &
+             (y >= crop_top) & (y < crop_top + crop_height))
+    px = np.floor((x[valid] - crop_left + 0.5) * resized_width / crop_width + pad_left).astype(np.int64)
+    py = np.floor((y[valid] - crop_top + 0.5) * resized_height / crop_height + pad_top).astype(np.int64)
+    return valid, np.clip(px, 0, target_width - 1), np.clip(py, 0, target_height - 1)
+
+
+def _vggt_depth_edge(depth, rtol=0.03, kernel_size=3):
+    """Mark unstable pixels near depth discontinuities."""
+    flat = depth.reshape(-1, *depth.shape[-2:])
+    pad = kernel_size // 2
+    padded = np.pad(flat, ((0, 0), (pad, pad), (pad, pad)), mode='edge')
+    local_min = np.full_like(flat, np.inf)
+    local_max = np.full_like(flat, -np.inf)
+    for y in range(kernel_size):
+        for x in range(kernel_size):
+            window = padded[:, y:y + flat.shape[1], x:x + flat.shape[2]]
+            local_min = np.minimum(local_min, window)
+            local_max = np.maximum(local_max, window)
+    return ((local_max - local_min) / np.maximum(np.abs(flat), 1e-6) > rtol).reshape(depth.shape)
+
+
+def compute_vggt_visibility(points_world, predictions_path, image_filenames, ixts, c2ws,
+                            source_visibility=None, depth_rel_tol=0.05,
+                            depth_abs_tol=0.05, conf_percentile=20.0,
+                            depth_edge_rtol=0.03):
+    """Compute VADT-view visibility using vggt-omega depth consistency.
+
+    A Waymo point is first associated with a VGGT world point through its pixel in
+    one source image.  Visibility is then evaluated in VGGT coordinates, avoiding
+    any assumption that the two reconstructions share a world coordinate system.
+    """
+    required = {'image_names', 'world_points_from_depth', 'depth', 'depth_conf',
+                'extrinsic', 'intrinsic'}
+    with np.load(predictions_path, allow_pickle=True) as data:
+        missing = required.difference(data.files)
+        if missing:
+            raise KeyError(f"VGGT predictions missing fields: {sorted(missing)}")
+        predictions = {key: data[key] for key in required}
+        pixel_transforms = data['pixel_transform'] if 'pixel_transform' in data.files else None
+
+    pred_names = [os.path.splitext(os.path.basename(str(name)))[0]
+                  for name in predictions['image_names']]
+    vadt_names = [os.path.splitext(os.path.basename(name))[0] for name in image_filenames]
+    vadt_by_name = {name: idx for idx, name in enumerate(vadt_names)}
+    pred_to_vadt = np.array([vadt_by_name.get(name, -1) for name in pred_names], dtype=np.int64)
+    if np.all(pred_to_vadt < 0):
+        raise ValueError('No VGGT image_names match the selected Waymo training views')
+
+    depth = predictions['depth'].astype(np.float64)
+    if depth.ndim == 4:
+        depth = depth[..., 0]
+    pred_ext = predictions['extrinsic'].astype(np.float64)
+    pred_ixt = predictions['intrinsic'].astype(np.float64)
+    world_points = predictions['world_points_from_depth']
+    confidence = predictions['depth_conf'].astype(np.float32)
+    if confidence.ndim == 4 and confidence.shape[-1] == 1:
+        confidence = confidence[..., 0]
+    finite_confidence = np.isfinite(confidence)
+    conf_threshold = (np.percentile(confidence[finite_confidence], conf_percentile)
+                      if conf_percentile > 0 and np.any(finite_confidence) else -np.inf)
+    confidence_mask = finite_confidence & (confidence >= conf_threshold) & (confidence > 1e-5)
+    if depth_edge_rtol > 0:
+        confidence_mask &= ~_vggt_depth_edge(depth, depth_edge_rtol)
+    target_h, target_w = depth.shape[1:3]
+    visibility = np.zeros((len(points_world), len(image_filenames)), dtype=np.bool_)
+    query_points = np.zeros((len(points_world), 3), dtype=np.float64)
+    source_pred = np.full(len(points_world), -1, dtype=np.int64)
+
+    if source_visibility is not None:
+        source_visibility = np.asarray(source_visibility, dtype=np.bool_)
+        expected_shape = (len(points_world), len(image_filenames))
+        if source_visibility.shape != expected_shape:
+            raise ValueError(f'source_visibility has shape {source_visibility.shape}, expected {expected_shape}')
+
+    # Select a genuine source observation when available, and transfer the point
+    # through the common image pixel.  This does not align the two 3D spaces.
+    pred_by_name = {name: idx for idx, name in enumerate(pred_names)}
+    for view_idx, name in enumerate(vadt_names):
+        pred_idx = pred_by_name.get(name)
+        if pred_idx is None:
+            continue
+        unassigned = source_pred < 0
+        if source_visibility is not None:
+            unassigned &= source_visibility[:, view_idx]
+        if not np.any(unassigned):
+            break
+        indices = np.flatnonzero(unassigned)
+        w2c = np.linalg.inv(c2ws[view_idx])
+        cam = points_world[indices] @ w2c[:3, :3].T + w2c[:3, 3]
+        projected = cam @ ixts[view_idx].T
+        x = projected[:, 0] / np.maximum(projected[:, 2], 1e-8)
+        y = projected[:, 1] / np.maximum(projected[:, 2], 1e-8)
+        raw_h, raw_w = image_heights[image_filename_to_cam(name)], image_widths[image_filename_to_cam(name)]
+        pixel_transform = None if pixel_transforms is None else pixel_transforms[pred_idx]
+        in_crop, px, py = _raw_pixels_to_vggt_pixels(
+            x, y, raw_w, raw_h, target_w, target_h, pixel_transform
+        )
+        in_crop &= cam[:, 2] > 1e-6
+        if not np.any(in_crop):
+            continue
+        # Recompute pixels after adding the positive-depth constraint.
+        chosen = indices[in_crop]
+        _, px, py = _raw_pixels_to_vggt_pixels(
+            x[in_crop], y[in_crop], raw_w, raw_h, target_w, target_h, pixel_transform
+        )
+        query_points[chosen] = world_points[pred_idx, py, px]
+        finite = (np.isfinite(query_points[chosen]).all(axis=1) &
+                  confidence_mask[pred_idx, py, px])
+        source_pred[chosen[finite]] = pred_idx
+
+    valid_query = source_pred >= 0
+    # A source observation is visible by construction. Keep the original VADT
+    # observations as a conservative fallback and add VGGT cross-view evidence.
+    if source_visibility is not None:
+        visibility[:] = source_visibility
+    else:
+        for point_idx in np.flatnonzero(valid_query):
+            vadt_idx = pred_to_vadt[source_pred[point_idx]]
+            if vadt_idx >= 0:
+                visibility[point_idx, vadt_idx] = True
+    for pred_idx, vadt_idx in enumerate(pred_to_vadt):
+        if vadt_idx < 0:
+            continue
+        indices = np.flatnonzero(valid_query & (source_pred != pred_idx))
+        if len(indices) == 0:
+            continue
+        cam = query_points[indices] @ pred_ext[pred_idx, :3, :3].T + pred_ext[pred_idx, :3, 3]
+        z = cam[:, 2]
+        projected = cam @ pred_ixt[pred_idx].T
+        px = np.rint(projected[:, 0] / np.maximum(projected[:, 2], 1e-8)).astype(np.int64)
+        py = np.rint(projected[:, 1] / np.maximum(projected[:, 2], 1e-8)).astype(np.int64)
+        in_view = (z > 1e-6) & (px >= 0) & (px < target_w) & (py >= 0) & (py < target_h)
+        visible_indices = indices[in_view]
+        if len(visible_indices) == 0:
+            continue
+        reference_depth = depth[pred_idx, py[in_view], px[in_view]]
+        tolerance = np.maximum(depth_abs_tol, depth_rel_tol * np.maximum(reference_depth, 1e-6))
+        consistent = (np.isfinite(reference_depth) & (reference_depth > 0) &
+                      (np.abs(z[in_view] - reference_depth) <= tolerance))
+        visibility[visible_indices[consistent], vadt_idx] = True
+
+    print(f'VGGT visibility: {valid_query.sum()}/{len(points_world)} points mapped, '
+          f'{visibility.sum()} visible point-view pairs')
+    return visibility
+
+
+def visualize_voxel_visibility(points_world, points_rgb, visibility, c2ws,
+                               max_voxels=2000, max_rays_per_voxel=6,
+                               ray_length=0.5):
+    """Visualize VADT voxels and short rays toward their visible Waymo views."""
+    if len(points_world) == 0:
+        print('Skipping visibility visualization: no voxels')
+        return
+    keep = np.arange(len(points_world))
+    if max_voxels > 0 and len(keep) > max_voxels:
+        keep = np.linspace(0, len(keep) - 1, max_voxels).astype(np.int64)
+    points = np.asarray(points_world)[keep, :3]
+    colors = np.asarray(points_rgb)[keep, :3]
+    visible = np.asarray(visibility, dtype=np.bool_)[keep]
+    camera_centers = np.asarray(c2ws)[:, :3, 3]
+
+    line_points, lines, line_colors = [], [], []
+    for point, view_mask in zip(points, visible):
+        view_ids = np.flatnonzero(view_mask)
+        if max_rays_per_voxel > 0 and len(view_ids) > max_rays_per_voxel:
+            selected = np.linspace(0, len(view_ids) - 1, max_rays_per_voxel).astype(np.int64)
+            view_ids = view_ids[selected]
+        for view_id in view_ids:
+            direction = camera_centers[view_id] - point
+            norm = np.linalg.norm(direction)
+            if norm <= 1e-8:
+                continue
+            start = len(line_points)
+            line_points.extend([point, point + direction / norm * ray_length])
+            lines.append([start, start + 1])
+            line_colors.append([0.1, 0.85, 1.0])
+
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points)
+    pcd.colors = o3d.utility.Vector3dVector(np.clip(colors, 0, 1))
+    geometries = [pcd]
+    if lines:
+        line_set = o3d.geometry.LineSet()
+        line_set.points = o3d.utility.Vector3dVector(np.asarray(line_points))
+        line_set.lines = o3d.utility.Vector2iVector(np.asarray(lines, dtype=np.int32))
+        line_set.colors = o3d.utility.Vector3dVector(np.asarray(line_colors))
+        geometries.append(line_set)
+    o3d.visualization.draw_geometries(geometries)
+
 # load ego pose and camera calibration(extrinsic and intrinsic)
 def load_camera_info(datadir):
     ego_pose_dir = os.path.join(datadir, 'ego_pose')
@@ -629,6 +839,9 @@ def generate_dataparser_outputs(
         print('build point cloud')
         pointcloud_dir = os.path.join(cfg.model_path, 'input_ply')
         os.makedirs(pointcloud_dir, exist_ok=True)
+
+        visibility_dir = os.path.join(cfg.model_path, "visibility")
+        os.makedirs(visibility_dir, exist_ok=True)
         
         points_xyz_dict = dict()
         points_rgb_dict = dict()
@@ -962,6 +1175,38 @@ def generate_dataparser_outputs(
             print('No colmap pointcloud')
             points_bkgd_xyz = np.array(downsample_outlier_pcd.points)
             points_bkgd_rgb = np.array(downsample_outlier_pcd.colors)
+
+        vggt_predictions = cfg.data.get('vggt_predictions', None)
+        if vggt_predictions:
+            if not os.path.isabs(vggt_predictions):
+                data_candidate = os.path.join(datadir, vggt_predictions)
+                output_candidate = os.path.join(visibility_dir, vggt_predictions)
+                vggt_predictions = (data_candidate if os.path.exists(data_candidate)
+                                    else output_candidate)
+            if not os.path.exists(vggt_predictions):
+                raise FileNotFoundError(f'VGGT predictions not found: {vggt_predictions}')
+            views_for_voxels = compute_vggt_visibility(
+                points_bkgd_xyz,
+                vggt_predictions,
+                image_filenames,
+                ixts,
+                c2ws,
+                source_visibility=np.asarray(views_for_voxels, dtype=np.bool_),
+                depth_rel_tol=cfg.data.get('vggt_depth_rel_tol', 0.05),
+                depth_abs_tol=cfg.data.get('vggt_depth_abs_tol', 0.05),
+                conf_percentile=cfg.data.get('vggt_conf_percentile', 20.0),
+                depth_edge_rtol=cfg.data.get('vggt_depth_edge_rtol', 0.03),
+            )
+            if cfg.data.get('visualize_vggt_visibility', False):
+                visualize_voxel_visibility(
+                    points_bkgd_xyz,
+                    points_bkgd_rgb,
+                    views_for_voxels,
+                    c2ws,
+                    max_voxels=cfg.data.get('vggt_vis_max_voxels', 20000),
+                    max_rays_per_voxel=cfg.data.get('vggt_vis_max_rays_per_voxel', 6),
+                    ray_length=cfg.data.get('vggt_vis_ray_length', 0.5),
+                )
 
 
 
