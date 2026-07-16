@@ -21,6 +21,7 @@ import numpy as np
 import cv2
 from lib.models.trellis import parallel_rasterize
 from lib.models.street_gaussian_model import quaternion_raw_multiply, matrix_to_quaternion, quaternion_to_matrix
+from lib.utils.general_utils import quaternion_to_matrix_numpy
 from lib.models.mvs import densify_bkgd_by_viewpoint
 ############################
 import time
@@ -38,6 +39,53 @@ import shutil
 from plyfile import PlyData, PlyElement
 inverse_opacity = lambda x: np.log(x/(1-x))
 inverse_scale = lambda x: np.log(x)
+
+
+def object_local_camera_centers(track_id, metadata, selected_frames, cams_per_frame):
+    """Return one camera center per view in an actor's canonical local frame."""
+    c2ws = np.asarray(metadata['c2ws'])
+    ego_poses = np.asarray(metadata['ego_frame_poses'])
+    tracklets = np.asarray(metadata['obj_tracklets'])
+    start_frame = int(selected_frames[0])
+    centers = np.full((len(c2ws), 3), np.nan, dtype=np.float64)
+    for view_id, c2w in enumerate(c2ws):
+        rel_frame = view_id // cams_per_frame
+        frame_id = start_frame + rel_frame
+        if rel_frame >= len(tracklets) or frame_id >= len(ego_poses):
+            continue
+        matches = np.flatnonzero(tracklets[rel_frame, :, 0].astype(np.int64) == int(track_id))
+        if len(matches) == 0:
+            continue
+        tracklet = tracklets[rel_frame, matches[0]]
+        obj_pose_vehicle = np.eye(4, dtype=np.float64)
+        obj_pose_vehicle[:3, :3] = quaternion_to_matrix_numpy(tracklet[4:8])
+        obj_pose_vehicle[:3, 3] = tracklet[1:4]
+        camera_world = np.append(c2w[:3, 3], 1.0)
+        camera_vehicle = camera_world @ np.linalg.inv(ego_poses[frame_id]).T
+        centers[view_id] = (camera_vehicle @ np.linalg.inv(obj_pose_vehicle).T)[:3]
+    return centers
+
+
+def visualize_grape_trellis_visibility(gaussians, model_names, **kwargs):
+    """Open visibility-direction views for background and/or dynamic actors."""
+    expanded_names = []
+    for name in model_names:
+        if name == 'all':
+            expanded_names.extend(gaussians.model_name_id.keys())
+        elif name == 'objects':
+            expanded_names.extend(item for item in gaussians.model_name_id if item.startswith('obj_'))
+        else:
+            expanded_names.append(name)
+    model_names = list(dict.fromkeys(expanded_names))
+    for model_name in model_names:
+        if model_name not in gaussians.model_name_id:
+            print(f'skip visibility visualization: unknown model {model_name}')
+            continue
+        model = getattr(gaussians, model_name)
+        if getattr(model, 'grape_trellis', None) is None:
+            continue
+        print(f'visualizing {model_name} visibility directions')
+        model.grape_trellis.visualize_visibility_view_directions(**kwargs)
 
 
 try:
@@ -177,7 +225,21 @@ def training():
     for obj_name in gaussians.model_name_id:
         obj_model = getattr(gaussians, obj_name)
         if obj_model.grape_trellis is not None:
-            obj_model.grape_trellis.set_param(dataset.scene_info.metadata["c2ws"], dataset.scene_info.metadata["ixts"], data_args.selected_frames, cams_per_frame=cams_per_frame)
+            camera_centers = None
+            if obj_name.startswith('obj_'):
+                camera_centers = object_local_camera_centers(
+                    obj_model.track_id,
+                    dataset.scene_info.metadata,
+                    data_args.selected_frames,
+                    cams_per_frame,
+                )
+            obj_model.grape_trellis.set_param(
+                dataset.scene_info.metadata["c2ws"],
+                dataset.scene_info.metadata["ixts"],
+                data_args.selected_frames,
+                cams_per_frame=cams_per_frame,
+                view_camera_centers=camera_centers,
+            )
     N_bkgd_init = gaussians.background.get_xyz.shape[0]
 
     viewpoint_stack = None
@@ -187,6 +249,22 @@ def training():
     
         iter_start.record()
         gaussians.update_learning_rate(iteration)
+
+        visibility_vis_iterations = data_args.get('visualize_visibility_iterations', [])
+        if isinstance(visibility_vis_iterations, int):
+            visibility_vis_iterations = [visibility_vis_iterations]
+        if iteration in visibility_vis_iterations:
+            model_names = data_args.get('visualize_visibility_models', ['background'])
+            if isinstance(model_names, str):
+                model_names = [model_names]
+            visualize_grape_trellis_visibility(
+                gaussians,
+                model_names,
+                max_voxels=data_args.get('visualize_visibility_max_voxels', 256),
+                max_views_per_voxel=data_args.get('visualize_visibility_max_views_per_voxel', 6),
+                line_length=data_args.get('visualize_visibility_line_length', None),
+                draw_camera_points=data_args.get('visualize_visibility_draw_cameras', True),
+            )
 
         # Every 1000 its we increase the levels of SH up to a maximum degree
         if iteration % 1000 == 0:
@@ -247,11 +325,6 @@ def training():
             image = soft_render_pkg["rgb"]
             _similarity = ssim(image, gt_image, mask=loss_mask)
             if _similarity < 0.8:
-            # if _similarity > 0.8:
-            #     continue
-
-                # ssim(image, gt_image, mask=loss_mask)
-                # loss_hard = 0
 
                 hard_render_pkg = gaussians_renderer.render(viewpoint_cam, gaussians, render_type="hard_depth")
                 hard_depth = hard_render_pkg["depth"][0]
@@ -265,25 +338,6 @@ def training():
                 if m1.sum() > (voxel_depth_tensor > 0).sum() * 0.2:
                     flag_local_reconstruct = True
 
-                # m2 = (voxel_depth_tensor > 0) & (hard_depth < voxel_depth_tensor * 0.9) # objects occluded
-                # mask = m1 | m2
-
-                # if optim_args.lambda_depth_lidar > 0 and lidar_depth is not None:            
-                #     depth_error = torch.abs((hard_depth[mask] - voxel_depth_tensor[mask]))
-                #     voxel_depth_loss = depth_error.mean()
-
-                #     loss_hard += optim_args.lambda_depth_lidar * voxel_depth_loss
-                        
-
-                # patch_range = (min(hard_depth.shape[1], hard_depth.shape[2]) // 20, max(hard_depth.shape[1], hard_depth.shape[2]) // 10) # zyk: to be tuned
-                # mono_depth[sky_mask] = mono_depth[~sky_mask].mean() # zyk: check if works?
-                # hard_depth[sky_mask] = hard_depth[~sky_mask].mean().detach()
-
-                # loss_l2_dpt = patch_norm_mse_loss(hard_depth[None,...], mono_depth[None,...], randint(patch_range[0], patch_range[1]), optim_args.error_tolerance)
-                # loss_hard += 0.1 * loss_l2_dpt
-
-                # loss_global = patch_norm_mse_loss_global(hard_depth[None,...], mono_depth[None,...], randint(patch_range[0], patch_range[1]), optim_args.error_tolerance)
-                # loss_hard += 1 * loss_global
 
                 acc = soft_render_pkg['acc']
 
@@ -309,29 +363,6 @@ def training():
                     v = obj_acc[actor_mask].kthvalue(k).values
                     if v.item() < 0.7:
                         flag_actor_reconstruct = True
-
-
-                # if flag_global_reconstruct or flag_local_reconstruct or flag_actor_reconstruct:
-                #     check_history = 10
-                #     check_interval = 0
-                
-                # if check_history > 0:
-                #     check_history -= 1
-                # else:
-                #     check_interval += 1
-                #     check_interval = min(check_interval, 19)
-
-                # acc = torch.clamp(acc, min=1e-6, max=1.-1e-6)
-                # sky_loss = torch.where(sky_mask, -torch.log(1 - acc), -torch.log(acc)).mean()
-
-                # loss_hard.backward()
-
-
-                # # Optimizer step
-                # if iteration < training_args.iterations:                
-                #     gaussians.update_optimizer()
-
-
 
 
         with torch.no_grad():

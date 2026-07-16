@@ -97,7 +97,14 @@ class GaussianModelActor(GaussianModel):
             # pointcloud_normal = np.asarray(pcd.normals)
             pointcloud_normal = np.asarray(pcd.normals) # 一阶球谐省略求解，直接计算方向
             pointcloud_normal = pointcloud_normal / np.linalg.norm(pointcloud_normal, axis=1, keepdims=True)
-            points_visibility = np.load(os.path.join(cfg.model_path, f"input_ply/points3D_{self.model_name}.npy"))
+            points_visibility = np.load(
+                os.path.join(cfg.model_path, f"input_ply/points3D_{self.model_name}.npy")
+            ).astype(np.bool_, copy=False)
+            if points_visibility.ndim != 2 or points_visibility.shape[0] != len(pointcloud_xyz):
+                raise ValueError(
+                    f'{self.model_name} visibility shape {points_visibility.shape} is incompatible '
+                    f'with {len(pointcloud_xyz)} voxels'
+                )
 
             preserve_mask = np.zeros_like(points_visibility, dtype=bool)
             preserve_mask[:, train_views] = True
@@ -518,6 +525,3 @@ class GaussianModelActor(GaussianModel):
             "rotation" : new_rotation,
             # "semantic" : new_semantic,
         })
-
-
-                            

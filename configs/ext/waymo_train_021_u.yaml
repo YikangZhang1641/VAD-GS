@@ -22,6 +22,15 @@ data:
   box_scale: 1.5
   shuffle: false
 
+  # Blocking Open3D inspection during training. Models accept background,
+  # objects, all, or an explicit actor such as obj_012.
+  visualize_visibility_iterations: []
+  visualize_visibility_models: [background, objects]
+  visualize_visibility_max_voxels: 256
+  visualize_visibility_max_views_per_voxel: 6
+  visualize_visibility_line_length: 1.2
+  visualize_visibility_draw_cameras: true
+
   tracking_refine:
     enabled: true
     checkpoint: /home/zyk/Projects/_DL/_Tracking/co-tracker/checkpoints/scaled_offline.pth
@@ -30,6 +39,12 @@ data:
     max_queries_per_call: 1024
     keyframe_stride: 5
     write_debug: true
+    # Object-local voxel-to-visible-view rays (Open3D, blocks preprocessing).
+    visualize_visibility: true
+    max_visualize_objects: 1
+    visibility_max_voxels: 1000
+    visibility_max_views_per_voxel: 6
+    visibility_ray_length: 0.5
 
 
 model:

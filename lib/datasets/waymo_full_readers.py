@@ -13,6 +13,47 @@ import copy
 import shutil
 sys.path.append(os.getcwd())
 
+
+def load_vggt_unscaled_depth(path, image_filenames):
+    """Load VGGT relative depth and map prediction rows to Waymo image names."""
+    predictions_path = cfg.data.get('vggt_predictions', None)
+    if not predictions_path:
+        return {}
+    if not os.path.isabs(predictions_path):
+        data_candidate = os.path.join(path, predictions_path)
+        output_candidate = os.path.join(cfg.model_path, 'visibility', predictions_path)
+        predictions_path = data_candidate if os.path.exists(data_candidate) else output_candidate
+    if not os.path.exists(predictions_path):
+        raise FileNotFoundError(f'VGGT predictions not found: {predictions_path}')
+
+    with np.load(predictions_path, allow_pickle=True) as predictions:
+        required = {'image_names', 'depth'}
+        missing = required.difference(predictions.files)
+        if missing:
+            raise KeyError(f'VGGT predictions missing fields for guidance: {sorted(missing)}')
+        names = [os.path.splitext(os.path.basename(str(name)))[0]
+                 for name in predictions['image_names']]
+        depths = predictions['depth'].astype(np.float32, copy=False)
+        if depths.ndim == 4 and depths.shape[-1] == 1:
+            depths = depths[..., 0]
+        transforms = predictions['pixel_transform'] if 'pixel_transform' in predictions.files else None
+
+    if len(names) != len(depths):
+        raise ValueError(f'VGGT image_names/depth length mismatch: {len(names)} vs {len(depths)}')
+    prediction_by_name = {name: idx for idx, name in enumerate(names)}
+    result = {}
+    for image_filename in image_filenames:
+        stem = os.path.splitext(os.path.basename(image_filename))[0]
+        pred_idx = prediction_by_name.get(stem)
+        if pred_idx is None:
+            continue
+        result[stem] = {
+            'depth': depths[pred_idx],
+            'pixel_transform': None if transforms is None else transforms[pred_idx],
+        }
+    print(f'Loaded VGGT unscaled depth for {len(result)}/{len(image_filenames)} Waymo views')
+    return result
+
 def readWaymoFullInfo(path, images='images', split_train=-1, split_test=-1, **kwargs):
 
     selected_frames = cfg.data.get('selected_frames', None)
@@ -74,6 +115,8 @@ def readWaymoFullInfo(path, images='images', split_train=-1, split_test=-1, **kw
     cams_timestamps = output['cams_timestamps']
     tracklet_timestamps = output['tracklet_timestamps']
     obj_bounds = output['obj_bounds']
+
+    vggt_unscaled_depth = load_vggt_unscaled_depth(path, image_filenames)
 
     ego_frame_poses = output['ego_frame_poses']
     obj_view_dict = output['obj_view_dict']
@@ -142,6 +185,13 @@ def readWaymoFullInfo(path, images='images', split_train=-1, split_test=-1, **kw
             camera_timestamps[cams[i]]['test_timestamps'].append(cams_timestamps[i])
         
         guidance = dict()
+
+        if image_name in vggt_unscaled_depth:
+            guidance['unscaled_depth'] = {
+                **vggt_unscaled_depth[image_name],
+                'raw_width': width,
+                'raw_height': height,
+            }
 
         # load dynamic mask
         if load_dynamic_mask:

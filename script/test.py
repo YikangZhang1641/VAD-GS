@@ -1525,6 +1525,7 @@ def refine_object_pose_and_points(
     point_filter_median_px,
     point_filter_bad_px,
     point_filter_max_bad_ratio,
+    tracking_visibility_sources=None,
 ):
     least_squares = require_least_squares()
     t_candidates = [
@@ -1552,6 +1553,24 @@ def refine_object_pose_and_points(
 
     obj_positions_local = np.concatenate([obj_positions, np.ones_like(obj_positions[..., :1])], axis=-1)
     visibility_arr = [obj_src[t]["query_mask"] for t in t1_list]
+
+    # Start from the LiDAR/projection observations and add every target frame in
+    # which CoTracker reports the corresponding query point as visible.
+    tracked_visibility = np.asarray(obj_visibility, dtype=bool).copy()
+    visibility_sources = obj_src if tracking_visibility_sources is None else tracking_visibility_sources
+    for entry in visibility_sources.values():
+        query_indices = np.flatnonzero(entry["query_mask"])
+        pred_visibility = np.asarray(entry["pred_visibility"], dtype=bool)
+        source_cam_offset = int(entry.get("source_cam_offset", cam_offset))
+        if pred_visibility.shape[1] != len(query_indices):
+            raise ValueError(
+                f"tracking visibility/query mismatch: {pred_visibility.shape[1]} vs {len(query_indices)}"
+            )
+        for rel_frame in range(min(pred_visibility.shape[0], end - start)):
+            visible_query = pred_visibility[rel_frame]
+            if np.any(visible_query):
+                target_view = rel_frame * num_cameras + source_cam_offset
+                tracked_visibility[query_indices[visible_query], target_view] = True
 
     r_vec_arr = []
     t_vec_arr = []
@@ -1601,7 +1620,7 @@ def refine_object_pose_and_points(
     obj_position_refined = []
     obj_colors_refined = []
     obj_normals_refined = []
-    observed_view_refined = []
+    observed_visibility_refined = []
     obj_indices_refined = []
     delta_r_dict = {}
     refined_pose_dict = {}
@@ -1624,7 +1643,7 @@ def refine_object_pose_and_points(
         obj_position_refined.append(points)
         obj_colors_refined.append(obj_colors[mask])
         obj_normals_refined.append(obj_normals[mask])
-        observed_view_refined.append([current_view] * points.shape[0])
+        observed_visibility_refined.append(tracked_visibility[mask])
         obj_indices_refined.append(np.where(mask)[0])
 
     r_vec_arr_ref = []
@@ -1667,7 +1686,7 @@ def refine_object_pose_and_points(
             obj_position_refined.append(points)
             obj_colors_refined.append(obj_colors[obj_view_mask])
             obj_normals_refined.append(obj_normals[obj_view_mask])
-            observed_view_refined.append([current_view] * points.shape[0])
+            observed_visibility_refined.append(tracked_visibility[obj_view_mask])
             obj_indices_refined.append(np.where(obj_view_mask)[0])
             continue
 
@@ -1706,13 +1725,13 @@ def refine_object_pose_and_points(
         obj_position_refined.append(points)
         obj_colors_refined.append(obj_colors[obj_view_mask])
         obj_normals_refined.append(obj_normals[obj_view_mask])
-        observed_view_refined.append([current_view] * points.shape[0])
+        observed_visibility_refined.append(tracked_visibility[obj_view_mask])
         obj_indices_refined.append(np.where(obj_view_mask)[0])
 
     obj_position_refined = np.vstack(obj_position_refined)
     obj_colors_refined = np.vstack(obj_colors_refined)
     obj_normals_refined = np.vstack(obj_normals_refined)
-    views_refined = np.hstack(observed_view_refined)
+    views_refined = np.vstack(observed_visibility_refined)
     obj_indices_refined = np.hstack(obj_indices_refined)
 
     if enable_point_filter:
@@ -1757,7 +1776,7 @@ def refine_object_pose_and_points(
     refined_visibility = np.zeros([np.asarray(downsampled_pcd.points).shape[0], (end - start) * num_cameras], dtype=bool)
     for point_id, indices in enumerate(point_indices_for_each_voxel):
         for idx in indices:
-            refined_visibility[point_id, views_refined[idx]] = True
+            refined_visibility[point_id] |= views_refined[idx]
 
     return downsampled_pcd, refined_visibility, refined_pose_dict, delta_r_dict, delta_anchors
 
@@ -1777,6 +1796,7 @@ def save_outputs(output_dir, vehicle_name, pcd, refined_visibility, refined_pose
         delta_pose_keys=np.array(sorted(delta_r_dict.keys())),
         delta_pose_values=np.array([delta_r_dict[k] for k in sorted(delta_r_dict.keys())]),
         delta_anchors=delta_anchors,
+        tracking_visibility_version=np.array(2, dtype=np.int32),
     )
     print(f"Saved refined point cloud: {ply_path}")
     print(f"Saved refined visibility: {vis_path}")
@@ -1920,7 +1940,7 @@ def refine_cache_paths(
             "point_filter_median_px": point_filter_median_px,
             "point_filter_bad_px": point_filter_bad_px,
             "point_filter_max_bad_ratio": point_filter_max_bad_ratio,
-            "version": "single_camera_refine_yaw_pitch_traj_point_filter_v1",
+            "version": "single_camera_refine_yaw_pitch_traj_point_filter_tracking_visibility_v2",
         }
     )
     cache_dir = os.path.join(save_dir, "refine_cache")

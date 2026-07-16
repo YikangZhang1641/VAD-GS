@@ -497,6 +497,80 @@ def padding_tracklets(tracklets, frame_timestamps, min_timestamp, max_timestamp)
         tracklets = np.concatenate([tracklets, tracklets_last[None]], axis=0)
         
     return tracklets, frame_timestamps
+
+
+def pose_matrix_to_tracklet_pose(pose):
+    obj_rotation = torch.from_numpy(pose[:3, :3]).float().unsqueeze(0)
+    obj_quaternion = matrix_to_quaternion(obj_rotation).squeeze(0).numpy()
+    obj_quaternion = obj_quaternion / np.linalg.norm(obj_quaternion)
+    return np.concatenate([pose[:3, 3], obj_quaternion])
+
+
+def apply_tracking_refined_poses_to_outputs(
+    object_tracklets_vehicle, obj_view_dict, refined_pose_by_object,
+    frames, frames_idx, start_frame,
+):
+    if not refined_pose_by_object:
+        return object_tracklets_vehicle, obj_view_dict
+
+    object_tracklets_vehicle = object_tracklets_vehicle.copy()
+    obj_view_dict = {track_id: dict(view_dict) for track_id, view_dict in obj_view_dict.items()}
+    frame_to_view_indices = {}
+    for view_idx, frame in enumerate(frames):
+        frame_to_view_indices.setdefault(int(frame), []).append(view_idx)
+
+    for track_id, refined_pose_dict in refined_pose_by_object.items():
+        for frame_id, refined_pose in refined_pose_dict.items():
+            frame_idx = int(frame_id) - start_frame
+            if frame_idx < 0 or frame_idx >= object_tracklets_vehicle.shape[0]:
+                continue
+            columns = np.where(
+                object_tracklets_vehicle[frame_idx, :, 0].astype(np.int64) == int(track_id)
+            )[0]
+            if len(columns) > 0:
+                object_tracklets_vehicle[frame_idx, columns[0], 1:8] = pose_matrix_to_tracklet_pose(refined_pose)
+            for view_idx in frame_to_view_indices.get(int(frame_id), []):
+                if track_id in obj_view_dict and view_idx in obj_view_dict[track_id]:
+                    obj_view_dict[track_id][view_idx][1] = refined_pose
+    return object_tracklets_vehicle, obj_view_dict
+
+
+def rebuild_object_bounds_and_views(
+    image_filenames, cams, frames_idx, ixts, exts,
+    object_tracklets_vehicle, object_info,
+):
+    obj_bounds = []
+    obj_view_dict = {}
+    for i, _ in tqdm(list(enumerate(image_filenames)), desc='rebuilding refined object bounds'):
+        cam = cams[i]
+        h, w = image_heights[cam], image_widths[cam]
+        obj_bound = np.zeros((h, w), dtype=np.uint8)
+        for obj_tracklet in object_tracklets_vehicle[frames_idx[i]]:
+            track_id = int(obj_tracklet[0])
+            if track_id < 0:
+                continue
+            obj_pose_vehicle = np.eye(4)
+            obj_pose_vehicle[:3, :3] = quaternion_to_matrix_numpy(obj_tracklet[4:8])
+            obj_pose_vehicle[:3, 3] = obj_tracklet[1:4]
+            obj_meta = object_info[track_id]
+            bbox = np.array([
+                [-obj_meta['length'], -obj_meta['width'], -obj_meta['height']],
+                [obj_meta['length'], obj_meta['width'], obj_meta['height']],
+            ]) * 0.5
+            corners_local = bbox_to_corner3d(bbox)
+            corners_local = np.concatenate(
+                [corners_local, np.ones_like(corners_local[..., :1])], axis=-1
+            )
+            corners_vehicle = corners_local @ obj_pose_vehicle.T
+            mask = get_bound_2d_mask(
+                corners_3d=corners_vehicle[..., :3], K=ixts[i],
+                pose=np.linalg.inv(exts[i]), H=h, W=w,
+            )
+            obj_bound = np.logical_or(obj_bound, mask)
+            if mask.sum() >= 20 * 20 * 10:
+                obj_view_dict.setdefault(track_id, {})[i] = [mask.sum(), obj_pose_vehicle]
+        obj_bounds.append(obj_bound)
+    return obj_bounds, obj_view_dict
     
 ###############################################################     
 def compute_sh_coefficients(normals):
@@ -1383,6 +1457,7 @@ def generate_dataparser_outputs(
         points_rgb_dict['bkgd'] = points_bkgd_rgb
             
         result['points_xyz_dict'] = points_xyz_dict
+
         result['points_rgb_dict'] = points_rgb_dict
 
         # Sample sky point cloud 
@@ -1488,4 +1563,72 @@ def generate_dataparser_outputs(
             except:
                 print(f'failed to save pointcloud for {k}')
                 continue
+
+        # Refine dynamic-object canonical point clouds and per-view visibility
+        # from 2D tracks. Background/VGGT visibility is intentionally untouched.
+        refined_pose_by_object = {}
+        if cfg.data.get('tracking_refine', False):
+            from lib.utils.waymo_tracking_refine_utils import run_tracking_refine_from_dataparser
+
+            refined_pose_by_object = run_tracking_refine_from_dataparser(
+                cfg=cfg,
+                datadir=datadir,
+                image_filenames=image_filenames,
+                ixts=ixts,
+                c2ws=c2ws,
+                ego_frame_poses=ego_frame_poses,
+                obj_view_dict=obj_view_dict,
+                object_tracklets_vehicle=object_tracklets_vehicle,
+                object_info=object_info,
+                cameras=cameras,
+                start_frame=start_frame,
+                end_frame_inclusive=end_frame,
+                bbox_to_corner3d=bbox_to_corner3d,
+                quaternion_to_matrix_numpy=quaternion_to_matrix_numpy,
+            )
+
+        if refined_pose_by_object:
+            object_tracklets_vehicle, obj_view_dict = apply_tracking_refined_poses_to_outputs(
+                object_tracklets_vehicle,
+                obj_view_dict,
+                refined_pose_by_object,
+                frames,
+                frames_idx,
+                start_frame,
+            )
+            obj_bounds, obj_view_dict = rebuild_object_bounds_and_views(
+                image_filenames,
+                cams,
+                frames_idx,
+                ixts,
+                exts,
+                object_tracklets_vehicle,
+                object_info,
+            )
+            result['obj_tracklets'] = object_tracklets_vehicle
+            result['obj_bounds'] = obj_bounds
+            result['obj_view_dict'] = obj_view_dict
+            result['tracking_refine_pose'] = refined_pose_by_object
+
+    elif cfg.data.get('tracking_refine', False):
+        # Reuse refined poses when an existing input point cloud skips the
+        # preprocessing block, keeping actor-local visibility directions valid.
+        from lib.utils.waymo_tracking_refine_utils import load_refined_pose_metadata
+
+        refined_pose_by_object = load_refined_pose_metadata(
+            cfg.model_path, object_info.keys()
+        )
+        if refined_pose_by_object:
+            object_tracklets_vehicle, obj_view_dict = apply_tracking_refined_poses_to_outputs(
+                object_tracklets_vehicle, obj_view_dict, refined_pose_by_object,
+                frames, frames_idx, start_frame,
+            )
+            obj_bounds, obj_view_dict = rebuild_object_bounds_and_views(
+                image_filenames, cams, frames_idx, ixts, exts,
+                object_tracklets_vehicle, object_info,
+            )
+            result['obj_tracklets'] = object_tracklets_vehicle
+            result['obj_bounds'] = obj_bounds
+            result['obj_view_dict'] = obj_view_dict
+            result['tracking_refine_pose'] = refined_pose_by_object
     return result

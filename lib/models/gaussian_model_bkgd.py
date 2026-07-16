@@ -62,7 +62,14 @@ class GaussianModelBkgd(GaussianModel):
         points_rgb = np.asarray(bkgd_pcd.colors)
         points_normal = np.asarray(bkgd_pcd.normals)[:,[2,0,1]] # 一阶球谐省略求解，直接计算方向
         points_normal = points_normal / np.linalg.norm(points_normal, axis=1, keepdims=True)
-        points_visibility = np.load(os.path.join(cfg.model_path, "input_ply/points3D_bkgd.npy"))
+        points_visibility = np.load(
+            os.path.join(cfg.model_path, "input_ply/points3D_bkgd.npy")
+        ).astype(np.bool_, copy=False)
+        if points_visibility.ndim != 2 or points_visibility.shape[0] != len(points_xyz):
+            raise ValueError(
+                f'background visibility shape {points_visibility.shape} is incompatible with '
+                f'{len(points_xyz)} voxels'
+            )
  
         preserve_mask = np.zeros_like(points_visibility, dtype=bool)
         preserve_mask[:, train_views] = True

@@ -132,6 +132,35 @@ def loadguidance(guidance, resolution): # 这里不载入cuda是因为全部装�
             new_guidance['obj_bound'] = PILtoTorch(v, resolution, resize_mode=Image.NEAREST).bool()
         elif k == 'lidar_depth':
             new_guidance['lidar_depth'] = NumpytoTorch(v, resolution, resize_mode=Image.NEAREST).float()
+        elif k == 'unscaled_depth':
+            depth = np.asarray(v['depth'], dtype=np.float32)
+            if depth.ndim == 3 and depth.shape[-1] == 1:
+                depth = depth[..., 0]
+            transform = v.get('pixel_transform', None)
+            raw_width, raw_height = int(v['raw_width']), int(v['raw_height'])
+            output_width, output_height = resolution
+            if transform is None:
+                restored = cv2.resize(depth, resolution, interpolation=cv2.INTER_LINEAR)
+            else:
+                (crop_left, crop_top, crop_width, crop_height, resized_width,
+                 resized_height, pad_left, pad_top) = np.asarray(transform, dtype=np.float64)
+                x0, y0 = int(round(pad_left)), int(round(pad_top))
+                x1 = min(depth.shape[1], x0 + int(round(resized_width)))
+                y1 = min(depth.shape[0], y0 + int(round(resized_height)))
+                content = depth[max(y0, 0):y1, max(x0, 0):x1]
+                restored = np.zeros((output_height, output_width), dtype=np.float32)
+                dst_x0 = int(round(crop_left * output_width / raw_width))
+                dst_y0 = int(round(crop_top * output_height / raw_height))
+                dst_x1 = int(round((crop_left + crop_width) * output_width / raw_width))
+                dst_y1 = int(round((crop_top + crop_height) * output_height / raw_height))
+                dst_x0, dst_y0 = max(dst_x0, 0), max(dst_y0, 0)
+                dst_x1, dst_y1 = min(dst_x1, output_width), min(dst_y1, output_height)
+                if content.size > 0 and dst_x1 > dst_x0 and dst_y1 > dst_y0:
+                    restored[dst_y0:dst_y1, dst_x0:dst_x1] = cv2.resize(
+                        content, (dst_x1 - dst_x0, dst_y1 - dst_y0),
+                        interpolation=cv2.INTER_LINEAR,
+                    )
+            new_guidance['unscaled_depth'] = torch.from_numpy(restored[None]).float()
         elif k== 'dynamic_mask':
             new_guidance['dynamic_mask'] = NumpytoTorch(v, resolution, resize_mode=Image.NEAREST).int()
         elif k=="mono_depth":

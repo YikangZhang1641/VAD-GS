@@ -98,11 +98,15 @@ class GrapeTrellis:
         self.vine_table.max_bound = data["max_bound"]
 
 
-    def set_param(self, c2ws, ixts, selected_frames, cams_per_frame):
+    def set_param(self, c2ws, ixts, selected_frames, cams_per_frame, view_camera_centers=None):
         self.c2ws = c2ws
         self.ixts = ixts
         self.start_frame = selected_frames[0] * cams_per_frame
         self.end_frame = (selected_frames[1] + 1) * cams_per_frame
+        self.view_camera_centers = (
+            np.asarray(c2ws)[:, :3, 3]
+            if view_camera_centers is None else np.asarray(view_camera_centers)
+        )
 
     def get_voxel_center_xyz(self):
         root_xyz = self.root_table.points_xyz
@@ -384,6 +388,95 @@ class GrapeTrellis:
                 view_line_set.colors = o3d.utility.Vector3dVector([[0, 0, 1]])
             lines.append(view_line_set)
         o3d.visualization.draw_geometries([voxel_bkgd] + lines)
+
+    def visualize_visibility_view_directions(
+        self,
+        voxel_indices=None,
+        max_voxels=256,
+        max_views_per_voxel=6,
+        line_length=None,
+        draw_camera_points=True,
+        draw_voxels=True,
+        draw=True,
+    ):
+        """Visualize bool visibility IDs as voxel-to-camera directions.
+
+        ``view_camera_centers`` must use the same coordinates as the Trellis
+        voxels: world coordinates for background, canonical object coordinates
+        for dynamic actors.
+        """
+        if self.c2ws is None or not hasattr(self, 'view_camera_centers'):
+            raise ValueError('Call GrapeTrellis.set_param(...) before visibility visualization.')
+
+        xyz = self.get_voxel_center_xyz()
+        colors = self.get_voxel_color()
+        visibility = self.get_visibility().astype(np.bool_)
+        camera_centers = np.asarray(self.view_camera_centers)
+        if visibility.shape[1] != len(camera_centers):
+            raise ValueError(
+                f'visibility has {visibility.shape[1]} views but camera centers has {len(camera_centers)}'
+            )
+        if voxel_indices is None:
+            voxel_indices = np.flatnonzero(visibility.any(axis=1))
+        else:
+            voxel_indices = np.asarray(voxel_indices, dtype=np.int64)
+        if max_voxels is not None and len(voxel_indices) > max_voxels:
+            keep = np.linspace(0, len(voxel_indices) - 1, max_voxels).astype(np.int64)
+            voxel_indices = voxel_indices[keep]
+        if line_length is None:
+            line_length = self.voxel_size * 8.0
+
+        line_points, line_indices, line_colors = [], [], []
+        cursor = 0
+        used_view_ids = set()
+        for voxel_idx in voxel_indices:
+            view_ids = np.flatnonzero(visibility[voxel_idx])
+            if max_views_per_voxel is not None and len(view_ids) > max_views_per_voxel:
+                keep = np.linspace(0, len(view_ids) - 1, max_views_per_voxel).astype(np.int64)
+                view_ids = view_ids[keep]
+            start = xyz[voxel_idx]
+            for view_id in view_ids:
+                camera_center = camera_centers[view_id]
+                if not np.isfinite(camera_center).all():
+                    continue
+                direction = camera_center - start
+                norm = np.linalg.norm(direction)
+                if norm < 1e-8:
+                    continue
+                end = start + direction / norm * line_length
+                line_points.extend([start, end])
+                line_indices.append([cursor, cursor + 1])
+                line_colors.append(plt.cm.hsv((int(view_id) * 0.61803398875) % 1.0)[:3])
+                cursor += 2
+                used_view_ids.add(int(view_id))
+
+        geometries = []
+        if draw_voxels:
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(xyz)
+            pcd.colors = o3d.utility.Vector3dVector(colors)
+            geometries.append(o3d.geometry.VoxelGrid.create_from_point_cloud(pcd, voxel_size=self.voxel_size))
+        if line_indices:
+            lines = o3d.geometry.LineSet()
+            lines.points = o3d.utility.Vector3dVector(np.asarray(line_points))
+            lines.lines = o3d.utility.Vector2iVector(np.asarray(line_indices, dtype=np.int32))
+            lines.colors = o3d.utility.Vector3dVector(np.asarray(line_colors))
+            geometries.append(lines)
+        if draw_camera_points and used_view_ids:
+            ids = np.asarray(sorted(used_view_ids), dtype=np.int64)
+            cameras = o3d.geometry.PointCloud()
+            cameras.points = o3d.utility.Vector3dVector(camera_centers[ids])
+            cameras.colors = o3d.utility.Vector3dVector(
+                np.tile(np.array([[0.05, 0.2, 1.0]]), (len(ids), 1))
+            )
+            geometries.append(cameras)
+        geometries.append(o3d.geometry.TriangleMesh.create_coordinate_frame(
+            size=max(self.voxel_size * 10.0, 1.0)
+        ))
+        print(f'visibility directions: {len(voxel_indices)} voxels, {len(line_indices)} rays')
+        if draw:
+            o3d.visualization.draw_geometries(geometries)
+        return geometries
     
     def visualize_root_and_vine(self):
         pcd_bkgd = o3d.geometry.PointCloud()
