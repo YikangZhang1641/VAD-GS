@@ -240,6 +240,10 @@ def training():
                 cams_per_frame=cams_per_frame,
                 view_camera_centers=camera_centers,
             )
+            if obj_name == 'background':
+                obj_model.grape_trellis.set_vggt_voxel_candidates(
+                    dataset.scene_info.metadata.get('vggt_voxel_info')
+                )
     N_bkgd_init = gaussians.background.get_xyz.shape[0]
 
     viewpoint_stack = None

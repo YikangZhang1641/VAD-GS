@@ -14,11 +14,11 @@ import shutil
 sys.path.append(os.getcwd())
 
 
-def load_vggt_unscaled_depth(path, image_filenames):
-    """Load VGGT relative depth and map prediction rows to Waymo image names."""
+def load_vggt_predictions(path, image_filenames):
+    """Load per-view VGGT guidance and the compact future-vine voxel table."""
     predictions_path = cfg.data.get('vggt_predictions', None)
     if not predictions_path:
-        return {}
+        return {}, None
     if not os.path.isabs(predictions_path):
         data_candidate = os.path.join(path, predictions_path)
         output_candidate = os.path.join(cfg.model_path, 'visibility', predictions_path)
@@ -37,6 +37,15 @@ def load_vggt_unscaled_depth(path, image_filenames):
         if depths.ndim == 4 and depths.shape[-1] == 1:
             depths = depths[..., 0]
         transforms = predictions['pixel_transform'] if 'pixel_transform' in predictions.files else None
+        pixel_voxel_ids = (predictions['vggt_pixel_voxel_ids']
+                           if 'vggt_pixel_voxel_ids' in predictions.files else None)
+        voxel_keys = {
+            'vggt_voxel_points', 'vggt_voxel_ids',
+            'vggt_voxel_source_offsets', 'vggt_voxel_source_view_ids',
+            'vggt_invalid_voxel_id', 'vggt_voxel_size',
+        }
+        voxel_info = ({key: predictions[key] for key in voxel_keys}
+                      if voxel_keys.issubset(predictions.files) else None)
 
     if len(names) != len(depths):
         raise ValueError(f'VGGT image_names/depth length mismatch: {len(names)} vs {len(depths)}')
@@ -49,10 +58,19 @@ def load_vggt_unscaled_depth(path, image_filenames):
             continue
         result[stem] = {
             'depth': depths[pred_idx],
+            'voxel_ids': None if pixel_voxel_ids is None else pixel_voxel_ids[pred_idx],
             'pixel_transform': None if transforms is None else transforms[pred_idx],
         }
+    if voxel_info is not None:
+        scene_view_by_name = {
+            os.path.splitext(os.path.basename(filename))[0]: idx
+            for idx, filename in enumerate(image_filenames)
+        }
+        voxel_info['prediction_to_scene_view'] = np.asarray(
+            [scene_view_by_name.get(name, -1) for name in names], dtype=np.int32,
+        )
     print(f'Loaded VGGT unscaled depth for {len(result)}/{len(image_filenames)} Waymo views')
-    return result
+    return result, voxel_info
 
 def readWaymoFullInfo(path, images='images', split_train=-1, split_test=-1, **kwargs):
 
@@ -116,7 +134,7 @@ def readWaymoFullInfo(path, images='images', split_train=-1, split_test=-1, **kw
     tracklet_timestamps = output['tracklet_timestamps']
     obj_bounds = output['obj_bounds']
 
-    vggt_unscaled_depth = load_vggt_unscaled_depth(path, image_filenames)
+    vggt_unscaled_depth, vggt_voxel_info = load_vggt_predictions(path, image_filenames)
 
     ego_frame_poses = output['ego_frame_poses']
     obj_view_dict = output['obj_view_dict']
@@ -139,6 +157,7 @@ def readWaymoFullInfo(path, images='images', split_train=-1, split_test=-1, **kw
     scene_metadata['obj_view_dict'] = obj_view_dict
     scene_metadata['c2ws'] = c2ws
     scene_metadata['ixts'] = ixts
+    scene_metadata['vggt_voxel_info'] = vggt_voxel_info
     
 
     camera_timestamps = dict()
@@ -188,10 +207,20 @@ def readWaymoFullInfo(path, images='images', split_train=-1, split_test=-1, **kw
 
         if image_name in vggt_unscaled_depth:
             guidance['unscaled_depth'] = {
-                **vggt_unscaled_depth[image_name],
+                'depth': vggt_unscaled_depth[image_name]['depth'],
+                'pixel_transform': vggt_unscaled_depth[image_name]['pixel_transform'],
                 'raw_width': width,
                 'raw_height': height,
             }
+            if vggt_unscaled_depth[image_name]['voxel_ids'] is not None:
+                guidance['vggt_voxel_id'] = {
+                    'voxel_ids': vggt_unscaled_depth[image_name]['voxel_ids'],
+                    'invalid_id': (np.iinfo(np.uint32).max if vggt_voxel_info is None else
+                                   int(np.asarray(vggt_voxel_info['vggt_invalid_voxel_id']).item())),
+                    'pixel_transform': vggt_unscaled_depth[image_name]['pixel_transform'],
+                    'raw_width': width,
+                    'raw_height': height,
+                }
 
         # load dynamic mask
         if load_dynamic_mask:

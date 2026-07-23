@@ -89,14 +89,24 @@ def compute_vggt_visibility(points_world, predictions_path, image_filenames, ixt
     one source image.  Visibility is then evaluated in VGGT coordinates, avoiding
     any assumption that the two reconstructions share a world coordinate system.
     """
-    required = {'image_names', 'world_points_from_depth', 'depth', 'depth_conf',
-                'extrinsic', 'intrinsic'}
     with np.load(predictions_path, allow_pickle=True) as data:
+        voxel_cache_keys = {
+            'vggt_voxel_points', 'vggt_voxel_source_offsets',
+            'vggt_voxel_source_view_ids', 'vggt_pixel_voxel_ids',
+            'vggt_invalid_voxel_id',
+        }
+        has_voxel_cache = voxel_cache_keys.issubset(data.files)
+        required = {'image_names'}
+        if not has_voxel_cache:
+            required |= {'world_points_from_depth', 'depth', 'depth_conf',
+                         'extrinsic', 'intrinsic'}
         missing = required.difference(data.files)
         if missing:
             raise KeyError(f"VGGT predictions missing fields: {sorted(missing)}")
         predictions = {key: data[key] for key in required}
         pixel_transforms = data['pixel_transform'] if 'pixel_transform' in data.files else None
+        voxel_cache = ({key: data[key] for key in voxel_cache_keys}
+                       if has_voxel_cache else None)
 
     pred_names = [os.path.splitext(os.path.basename(str(name)))[0]
                   for name in predictions['image_names']]
@@ -106,25 +116,30 @@ def compute_vggt_visibility(points_world, predictions_path, image_filenames, ixt
     if np.all(pred_to_vadt < 0):
         raise ValueError('No VGGT image_names match the selected Waymo training views')
 
-    depth = predictions['depth'].astype(np.float64)
-    if depth.ndim == 4:
-        depth = depth[..., 0]
-    pred_ext = predictions['extrinsic'].astype(np.float64)
-    pred_ixt = predictions['intrinsic'].astype(np.float64)
-    world_points = predictions['world_points_from_depth']
-    confidence = predictions['depth_conf'].astype(np.float32)
-    if confidence.ndim == 4 and confidence.shape[-1] == 1:
-        confidence = confidence[..., 0]
-    finite_confidence = np.isfinite(confidence)
-    conf_threshold = (np.percentile(confidence[finite_confidence], conf_percentile)
-                      if conf_percentile > 0 and np.any(finite_confidence) else -np.inf)
-    confidence_mask = finite_confidence & (confidence >= conf_threshold) & (confidence > 1e-5)
-    if depth_edge_rtol > 0:
-        confidence_mask &= ~_vggt_depth_edge(depth, depth_edge_rtol)
-    target_h, target_w = depth.shape[1:3]
+    if has_voxel_cache:
+        world_points = depth = pred_ext = pred_ixt = confidence_mask = None
+        target_h, target_w = voxel_cache['vggt_pixel_voxel_ids'].shape[1:3]
+    else:
+        depth = predictions['depth'].astype(np.float64)
+        if depth.ndim == 4:
+            depth = depth[..., 0]
+        pred_ext = predictions['extrinsic'].astype(np.float64)
+        pred_ixt = predictions['intrinsic'].astype(np.float64)
+        world_points = predictions['world_points_from_depth']
+        confidence = predictions['depth_conf'].astype(np.float32)
+        if confidence.ndim == 4 and confidence.shape[-1] == 1:
+            confidence = confidence[..., 0]
+        finite_confidence = np.isfinite(confidence)
+        conf_threshold = (np.percentile(confidence[finite_confidence], conf_percentile)
+                          if conf_percentile > 0 and np.any(finite_confidence) else -np.inf)
+        confidence_mask = finite_confidence & (confidence >= conf_threshold) & (confidence > 1e-5)
+        if depth_edge_rtol > 0:
+            confidence_mask &= ~_vggt_depth_edge(depth, depth_edge_rtol)
+        target_h, target_w = depth.shape[1:3]
     visibility = np.zeros((len(points_world), len(image_filenames)), dtype=np.bool_)
     query_points = np.zeros((len(points_world), 3), dtype=np.float64)
     source_pred = np.full(len(points_world), -1, dtype=np.int64)
+    query_voxel = np.full(len(points_world), -1, dtype=np.int64)
 
     if source_visibility is not None:
         source_visibility = np.asarray(source_visibility, dtype=np.bool_)
@@ -163,9 +178,16 @@ def compute_vggt_visibility(points_world, predictions_path, image_filenames, ixt
         _, px, py = _raw_pixels_to_vggt_pixels(
             x[in_crop], y[in_crop], raw_w, raw_h, target_w, target_h, pixel_transform
         )
-        query_points[chosen] = world_points[pred_idx, py, px]
-        finite = (np.isfinite(query_points[chosen]).all(axis=1) &
-                  confidence_mask[pred_idx, py, px])
+        if has_voxel_cache:
+            voxel_ids = voxel_cache['vggt_pixel_voxel_ids'][pred_idx, py, px]
+            invalid_id = int(np.asarray(voxel_cache['vggt_invalid_voxel_id']).item())
+            finite = voxel_ids.astype(np.uint64) != invalid_id
+            query_voxel[chosen[finite]] = voxel_ids[finite].astype(np.int64)
+            query_points[chosen[finite]] = voxel_cache['vggt_voxel_points'][voxel_ids[finite]]
+        else:
+            query_points[chosen] = world_points[pred_idx, py, px]
+            finite = (np.isfinite(query_points[chosen]).all(axis=1) &
+                      confidence_mask[pred_idx, py, px])
         source_pred[chosen[finite]] = pred_idx
 
     valid_query = source_pred >= 0
@@ -178,6 +200,20 @@ def compute_vggt_visibility(points_world, predictions_path, image_filenames, ixt
             vadt_idx = pred_to_vadt[source_pred[point_idx]]
             if vadt_idx >= 0:
                 visibility[point_idx, vadt_idx] = True
+
+    if has_voxel_cache:
+        offsets = voxel_cache['vggt_voxel_source_offsets']
+        source_ids = voxel_cache['vggt_voxel_source_view_ids']
+        for point_idx in np.flatnonzero(valid_query):
+            voxel_id = query_voxel[point_idx]
+            begin, end = int(offsets[voxel_id]), int(offsets[voxel_id + 1])
+            pred_view_ids = source_ids[begin:end].astype(np.int64, copy=False)
+            vadt_view_ids = pred_to_vadt[pred_view_ids]
+            visibility[point_idx, vadt_view_ids[vadt_view_ids >= 0]] = True
+        print(f'VGGT voxel cache visibility: {valid_query.sum()}/{len(points_world)} points mapped, '
+              f'{visibility.sum()} visible point-view pairs')
+        return visibility
+
     for pred_idx, vadt_idx in enumerate(pred_to_vadt):
         if vadt_idx < 0:
             continue

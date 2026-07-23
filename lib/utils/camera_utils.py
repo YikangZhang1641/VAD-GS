@@ -103,7 +103,10 @@ class Camera(nn.Module):
     def set_device(self, device):
         self.original_image = self.original_image.to(device)
         for k, v in self.guidance.items():
-            self.guidance[k] = v.to(device, non_blocking=True)
+            # Dense ID maps are lookup indices for the CPU-resident VGGT cache;
+            # keeping them on CPU avoids spending GPU memory before vine filling.
+            if k != 'vggt_voxel_id':
+                self.guidance[k] = v.to(device, non_blocking=True)
 
         
 class MiniCam:
@@ -161,6 +164,40 @@ def loadguidance(guidance, resolution): # 这里不载入cuda是因为全部装�
                         interpolation=cv2.INTER_LINEAR,
                     )
             new_guidance['unscaled_depth'] = torch.from_numpy(restored[None]).float()
+        elif k == 'vggt_voxel_id':
+            point_ids = np.asarray(v['voxel_ids'])
+            invalid_id = int(v['invalid_id'])
+            # Use -1 internally so the map is compact and directly usable as an index mask.
+            point_ids = point_ids.astype(np.int64)
+            point_ids[point_ids == invalid_id] = -1
+            transform = v.get('pixel_transform', None)
+            raw_width, raw_height = int(v['raw_width']), int(v['raw_height'])
+            output_width, output_height = resolution
+            if transform is None:
+                restored_ids = cv2.resize(
+                    point_ids.astype(np.int32), resolution, interpolation=cv2.INTER_NEAREST,
+                ).astype(np.int64)
+            else:
+                (crop_left, crop_top, crop_width, crop_height, resized_width,
+                 resized_height, pad_left, pad_top) = np.asarray(transform, dtype=np.float64)
+                x0, y0 = int(round(pad_left)), int(round(pad_top))
+                x1 = min(point_ids.shape[1], x0 + int(round(resized_width)))
+                y1 = min(point_ids.shape[0], y0 + int(round(resized_height)))
+                content = point_ids[max(y0, 0):y1, max(x0, 0):x1]
+                restored_ids = np.full((output_height, output_width), -1, dtype=np.int32)
+                dst_x0 = int(round(crop_left * output_width / raw_width))
+                dst_y0 = int(round(crop_top * output_height / raw_height))
+                dst_x1 = int(round((crop_left + crop_width) * output_width / raw_width))
+                dst_y1 = int(round((crop_top + crop_height) * output_height / raw_height))
+                dst_x0, dst_y0 = max(dst_x0, 0), max(dst_y0, 0)
+                dst_x1, dst_y1 = min(dst_x1, output_width), min(dst_y1, output_height)
+                if content.size > 0 and dst_x1 > dst_x0 and dst_y1 > dst_y0:
+                    restored_ids[dst_y0:dst_y1, dst_x0:dst_x1] = cv2.resize(
+                        content.astype(np.int32), (dst_x1 - dst_x0, dst_y1 - dst_y0),
+                        interpolation=cv2.INTER_NEAREST,
+                    )
+                restored_ids = restored_ids.astype(np.int64)
+            new_guidance['vggt_voxel_id'] = torch.from_numpy(restored_ids)
         elif k== 'dynamic_mask':
             new_guidance['dynamic_mask'] = NumpytoTorch(v, resolution, resize_mode=Image.NEAREST).int()
         elif k=="mono_depth":

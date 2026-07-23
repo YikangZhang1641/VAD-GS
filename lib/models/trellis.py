@@ -27,6 +27,16 @@ class GrapeTrellis:
         self.c2ws = None
         self.ixts = None
 
+        # VGGT-space candidates are deliberately separate from root/vine.  Their
+        # coordinates are unscaled and must not enter the Waymo trellis geometry
+        # until a future vine reconstruction/alignment step.
+        self.vggt_voxel_xyz = None
+        self.vggt_voxel_ids = None
+        self.vggt_voxel_source_offsets = None
+        self.vggt_voxel_source_view_ids = None
+        self.vggt_voxel_size = None
+        self.vggt_prediction_to_scene_view = None
+
         ctr2corners = []
         for i in [-1,1]:
             for j in [-1,1]:
@@ -68,6 +78,13 @@ class GrapeTrellis:
             "vine_points_ray_vector": self.vine_table.points_ray_vector,
             "vine_view_diversity": self.vine_table.view_diversity,
             "vine_hash_voxel_table_id": self.vine_table.hash_voxel_table_id,
+
+            "vggt_voxel_xyz": self.vggt_voxel_xyz,
+            "vggt_voxel_ids": self.vggt_voxel_ids,
+            "vggt_voxel_source_offsets": self.vggt_voxel_source_offsets,
+            "vggt_voxel_source_view_ids": self.vggt_voxel_source_view_ids,
+            "vggt_voxel_size": self.vggt_voxel_size,
+            "vggt_prediction_to_scene_view": self.vggt_prediction_to_scene_view,
         }
         np.savez(path, **data)
         
@@ -97,6 +114,21 @@ class GrapeTrellis:
         self.vine_table.min_bound = data["min_bound"]
         self.vine_table.max_bound = data["max_bound"]
 
+        if "vggt_voxel_xyz" in data.files and data["vggt_voxel_xyz"].dtype != object:
+            self.vggt_voxel_xyz = data["vggt_voxel_xyz"]
+            self.vggt_voxel_ids = data["vggt_voxel_ids"]
+            self.vggt_voxel_source_offsets = data["vggt_voxel_source_offsets"]
+            self.vggt_voxel_source_view_ids = data["vggt_voxel_source_view_ids"]
+            self.vggt_voxel_size = data["vggt_voxel_size"].item()
+            self.vggt_prediction_to_scene_view = data["vggt_prediction_to_scene_view"]
+        elif "vggt_point_xyz" in data.files and data["vggt_point_xyz"].dtype != object:
+            # Compatibility with trellis files produced by the interim naming.
+            self.vggt_voxel_xyz = data["vggt_point_xyz"]
+            self.vggt_voxel_ids = data["vggt_point_ids"]
+            self.vggt_voxel_source_offsets = data["vggt_point_source_offsets"]
+            self.vggt_voxel_source_view_ids = data["vggt_point_source_view_ids"]
+            self.vggt_prediction_to_scene_view = data["vggt_prediction_to_scene_view"]
+
 
     def set_param(self, c2ws, ixts, selected_frames, cams_per_frame, view_camera_centers=None):
         self.c2ws = c2ws
@@ -107,6 +139,40 @@ class GrapeTrellis:
             np.asarray(c2ws)[:, :3, 3]
             if view_camera_centers is None else np.asarray(view_camera_centers)
         )
+
+    def set_vggt_voxel_candidates(self, voxel_info):
+        """Attach compact VGGT candidates for future vine completion."""
+        if voxel_info is None:
+            return
+        self.vggt_voxel_xyz = np.asarray(voxel_info['vggt_voxel_points'], dtype=np.float32)
+        self.vggt_voxel_ids = np.asarray(voxel_info['vggt_voxel_ids'], dtype=np.uint32)
+        self.vggt_voxel_source_offsets = np.asarray(
+            voxel_info['vggt_voxel_source_offsets'], dtype=np.uint64,
+        )
+        self.vggt_voxel_source_view_ids = np.asarray(
+            voxel_info['vggt_voxel_source_view_ids'],
+        )
+        self.vggt_voxel_size = float(np.asarray(voxel_info['vggt_voxel_size']).item())
+        self.vggt_prediction_to_scene_view = np.asarray(
+            voxel_info['prediction_to_scene_view'], dtype=np.int32,
+        )
+        if len(self.vggt_voxel_xyz) != len(self.vggt_voxel_ids):
+            raise ValueError('VGGT voxel xyz/id length mismatch')
+        if len(self.vggt_voxel_source_offsets) != len(self.vggt_voxel_ids) + 1:
+            raise ValueError('VGGT voxel source offsets must have M+1 entries')
+
+    def get_vggt_voxel_source_views(self, voxel_id):
+        """Return scene view IDs whose pixels contributed to one VGGT voxel."""
+        if self.vggt_voxel_ids is None:
+            return np.empty(0, dtype=np.int32)
+        voxel_id = int(voxel_id)
+        if voxel_id < 0 or voxel_id >= len(self.vggt_voxel_ids):
+            return np.empty(0, dtype=np.int32)
+        begin = int(self.vggt_voxel_source_offsets[voxel_id])
+        end = int(self.vggt_voxel_source_offsets[voxel_id + 1])
+        prediction_views = self.vggt_voxel_source_view_ids[begin:end].astype(np.int64, copy=False)
+        scene_views = self.vggt_prediction_to_scene_view[prediction_views]
+        return scene_views[scene_views >= 0]
 
     def get_voxel_center_xyz(self):
         root_xyz = self.root_table.points_xyz

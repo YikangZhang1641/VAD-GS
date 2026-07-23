@@ -21,6 +21,8 @@ REQUIRED_OUTPUTS = (
     "world_points_from_depth",
 )
 
+INVALID_VOXEL_ID = np.iinfo(np.uint32).max
+
 
 def build_pixel_transforms(image_names, image_resolution, target_height, target_width, patch_size=16):
     """Describe VGGT's crop, balanced resize and common-size center padding."""
@@ -93,6 +95,69 @@ def confidence_mask(depth_conf, depth, percentile, edge_rtol):
     if percentile > 0 and np.any(mask):
         mask &= depth_conf >= np.percentile(depth_conf[mask], percentile)
     return mask
+
+
+def build_vggt_voxel_point_cloud(predictions, voxel_size, conf_percentile, edge_rtol):
+    """Build VGGT-Omega's filtered cloud and a compact pixel->voxel->views index.
+
+    Point/view membership is stored as CSR arrays rather than an object array of
+    Python lists.  Pixel entries rejected by VGGT's point-cloud filter contain
+    ``INVALID_VOXEL_ID``.
+    """
+    if voxel_size <= 0:
+        raise ValueError("--point-cloud-voxel-size must be positive")
+
+    points_map = np.asarray(predictions["world_points_from_depth"])
+    num_views, height, width = points_map.shape[:3]
+    valid = confidence_mask(
+        np.asarray(predictions["depth_conf"]), predictions["depth"],
+        conf_percentile, edge_rtol,
+    )
+    if valid.ndim == 4 and valid.shape[-1] == 1:
+        valid = valid[..., 0]
+    valid &= np.isfinite(points_map).all(axis=-1)
+    if not np.any(valid):
+        raise RuntimeError("No VGGT points remain after confidence/depth-edge filtering")
+
+    points = points_map[valid].astype(np.float32, copy=False)
+    voxel_keys = np.floor(points / voxel_size).astype(np.int64)
+    _, inverse, counts = np.unique(
+        voxel_keys, axis=0, return_inverse=True, return_counts=True,
+    )
+    num_voxels = len(counts)
+    if num_voxels >= INVALID_VOXEL_ID:
+        raise OverflowError("VGGT voxel count does not fit in the uint32 pixel index")
+
+    point_sum = np.zeros((num_voxels, 3), dtype=np.float64)
+    np.add.at(point_sum, inverse, points)
+    voxel_points = (point_sum / counts[:, None]).astype(np.float32)
+
+    pixel_voxel_ids = np.full((num_views, height, width), INVALID_VOXEL_ID, dtype=np.uint32)
+    pixel_voxel_ids[valid] = inverse.astype(np.uint32, copy=False)
+
+    source_views = np.broadcast_to(
+        np.arange(num_views, dtype=np.int64)[:, None, None], valid.shape,
+    )[valid]
+    # Unique (voxel, source view) pairs, ordered by voxel, form CSR directly.
+    pairs = np.unique(inverse.astype(np.int64) * num_views + source_views)
+    pair_voxels = pairs // num_views
+    source_view_ids = (pairs % num_views).astype(
+        np.uint16 if num_views <= np.iinfo(np.uint16).max else np.uint32,
+    )
+    source_offsets = np.zeros(num_voxels + 1, dtype=np.uint64)
+    source_offsets[1:] = np.cumsum(
+        np.bincount(pair_voxels, minlength=num_voxels), dtype=np.uint64,
+    )
+
+    return {
+        "vggt_voxel_points": voxel_points,
+        "vggt_voxel_ids": np.arange(num_voxels, dtype=np.uint32),
+        "vggt_voxel_source_offsets": source_offsets,
+        "vggt_voxel_source_view_ids": source_view_ids,
+        "vggt_pixel_voxel_ids": pixel_voxel_ids,
+        "vggt_invalid_voxel_id": np.asarray(INVALID_VOXEL_ID, dtype=np.uint32),
+        "vggt_voxel_size": np.asarray(voxel_size, dtype=np.float32),
+    }
 
 
 def project_points(points, extrinsic, intrinsic):
@@ -213,6 +278,8 @@ def parse_args():
     parser.add_argument("--pixel-stride", type=int, default=6)
     parser.add_argument("--max-vis-points", type=int, default=100000)
     parser.add_argument("--voxel-size", type=float, default=0.08)
+    parser.add_argument("--point-cloud-voxel-size", type=float, default=0.08,
+                        help="VGGT-space voxel size for the saved pixel->voxel->views index.")
     parser.add_argument("--max-vis-voxels", type=int, default=5000)
     parser.add_argument("--max-rays-per-point", type=int, default=6)
     parser.add_argument("--ray-length", type=float, default=0.25)
@@ -263,22 +330,44 @@ def main():
     predictions["world_points_from_depth"] = unproject_depth_map_to_point_map(
         predictions["depth"], predictions["extrinsic"], predictions["intrinsic"]
     )
+    voxel_cache = build_vggt_voxel_point_cloud(
+        predictions, args.point_cloud_voxel_size, args.conf_percentile,
+        args.depth_edge_rtol,
+    )
+    predictions.update(voxel_cache)
     missing = set(REQUIRED_OUTPUTS).difference(predictions)
     if missing:
         raise KeyError(f"VGGT output is missing required fields: {sorted(missing)}")
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(args.output, **predictions)
-    print(f"Saved {len(image_names)} VGGT views to {args.output}")
+    # Keep the on-disk interface intentionally small.  Raw VGGT tokens/features,
+    # input images and the dense [V,H,W,3] point map are only generation-time data.
+    saved_predictions = {
+        "image_names": predictions["image_names"],
+        "depth": predictions["depth"],
+        "pixel_transform": predictions["pixel_transform"],
+        **voxel_cache,
+    }
+    np.savez_compressed(args.output, **saved_predictions)
+    source_counts = np.diff(predictions["vggt_voxel_source_offsets"])
+    print(f"Saved {len(image_names)} VGGT views and "
+          f"{len(predictions['vggt_voxel_points'])} filtered voxels to {args.output}; "
+          f"source views/voxel median={np.median(source_counts):.1f}, "
+          f"mean={source_counts.mean():.2f}")
 
-    points, colors, visibility = sample_visibility(
-        predictions, args.conf_percentile, args.depth_edge_rtol, args.pixel_stride,
-        args.max_vis_points, args.depth_rel_tol, args.depth_abs_tol,
+    # Visualize the exact cache written above, rather than constructing a second
+    # sampled point cloud with different voxelization/visibility semantics.
+    points = voxel_cache["vggt_voxel_points"]
+    colors = np.full((len(points), 3), (0.72, 0.72, 0.72), dtype=np.float32)
+    visibility = np.zeros((len(points), len(image_names)), dtype=np.bool_)
+    offsets = voxel_cache["vggt_voxel_source_offsets"]
+    source_ids = voxel_cache["vggt_voxel_source_view_ids"].astype(np.int64, copy=False)
+    voxel_ids = np.repeat(
+        np.arange(len(points), dtype=np.int64),
+        np.diff(offsets).astype(np.int64, copy=False),
     )
-    points, colors, visibility = voxelize_visibility(
-        points, colors, visibility, args.voxel_size, args.max_vis_voxels
-    )
+    visibility[voxel_ids, source_ids] = True
     counts = visibility.sum(axis=1)
-    print(f"Visibility sample: {len(points)} points; views/point "
+    print(f"Saved-cache visualization: {len(points)} voxels; source views/voxel "
           f"median={np.median(counts):.1f}, mean={counts.mean():.2f}, max={counts.max()}")
     if not args.no_vis:
         visualize_visibility(points, colors, visibility, predictions["extrinsic"],
