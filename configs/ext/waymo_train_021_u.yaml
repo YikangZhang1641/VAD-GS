@@ -31,6 +31,16 @@ data:
   visualize_visibility_line_length: 1.2
   visualize_visibility_draw_cameras: true
 
+  # Diagnostic only: backproject vacancy pixels with VGGT relative depth, then
+  # draw rays toward their pseudo-voxel source views using Waymo camera poses.
+  visualize_vggt_vacancy_max_points: 50000
+  visualize_vggt_vacancy_max_voxels: 256
+  visualize_vggt_vacancy_max_views_per_voxel: 6
+  visualize_vggt_vacancy_ray_length: 1.0
+  visualize_vggt_triangulation_max_root_points: 100000
+  vggt_triangulation_min_views: 2
+  vggt_triangulation_max_reprojection_error: 20.0
+
   tracking_refine:
     enabled: true
     checkpoint: /home/zyk/Projects/_DL/_Tracking/co-tracker/checkpoints/scaled_offline.pth

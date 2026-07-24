@@ -105,7 +105,7 @@ def build_vggt_voxel_point_cloud(predictions, voxel_size, conf_percentile, edge_
     ``INVALID_VOXEL_ID``.
     """
     if voxel_size <= 0:
-        raise ValueError("--point-cloud-voxel-size must be positive")
+        raise ValueError("--voxel-size must be positive")
 
     points_map = np.asarray(predictions["world_points_from_depth"])
     num_views, height, width = points_map.shape[:3]
@@ -160,71 +160,6 @@ def build_vggt_voxel_point_cloud(predictions, voxel_size, conf_percentile, edge_
     }
 
 
-def project_points(points, extrinsic, intrinsic):
-    cam = points @ extrinsic[:3, :3].T + extrinsic[:3, 3]
-    projected = cam @ intrinsic.T
-    z = cam[:, 2]
-    return projected[:, 0] / np.maximum(z, 1e-8), projected[:, 1] / np.maximum(z, 1e-8), z
-
-
-def sample_visibility(predictions, conf_percentile, edge_rtol, pixel_stride,
-                      max_points, rel_tol, abs_tol):
-    points_map = predictions["world_points_from_depth"]
-    depth = predictions["depth"]
-    depth_3d = depth[..., 0] if depth.ndim == 4 else depth
-    mask = confidence_mask(predictions["depth_conf"], depth, conf_percentile, edge_rtol)
-    yy, xx = np.meshgrid(np.arange(points_map.shape[1]), np.arange(points_map.shape[2]), indexing="ij")
-    mask &= (yy % max(pixel_stride, 1) == 0) & (xx % max(pixel_stride, 1) == 0)
-    source_view = np.broadcast_to(np.arange(len(points_map))[:, None, None], mask.shape)[mask]
-    points = points_map[mask]
-    colors = predictions["images"]
-    if colors.ndim == 4 and colors.shape[1] == 3:
-        colors = np.transpose(colors, (0, 2, 3, 1))
-    colors = colors[mask]
-    finite = np.isfinite(points).all(axis=1)
-    points, colors, source_view = points[finite], colors[finite], source_view[finite]
-    if max_points > 0 and len(points) > max_points:
-        keep = np.linspace(0, len(points) - 1, max_points).astype(np.int64)
-        points, colors, source_view = points[keep], colors[keep], source_view[keep]
-
-    visibility = np.zeros((len(points), len(points_map)), dtype=bool)
-    visibility[np.arange(len(points)), source_view] = True
-    height, width = depth_3d.shape[1:]
-    for view in range(len(points_map)):
-        u, v, z = project_points(points, predictions["extrinsic"][view], predictions["intrinsic"][view])
-        px, py = np.rint(u).astype(np.int64), np.rint(v).astype(np.int64)
-        inside = (z > 1e-6) & (px >= 0) & (px < width) & (py >= 0) & (py < height)
-        idx = np.flatnonzero(inside & (source_view != view))
-        if len(idx) == 0:
-            continue
-        reference = depth_3d[view, py[idx], px[idx]]
-        tolerance = np.maximum(abs_tol, rel_tol * np.maximum(reference, 1e-6))
-        good = np.isfinite(reference) & (reference > 0) & (np.abs(z[idx] - reference) <= tolerance)
-        visibility[idx[good], view] = True
-    return points, np.clip(colors, 0, 1), visibility
-
-
-def voxelize_visibility(points, colors, visibility, voxel_size, max_voxels):
-    if voxel_size <= 0:
-        raise ValueError("--voxel-size must be positive")
-    voxel_index = np.floor(points / voxel_size).astype(np.int64)
-    _, inverse, counts = np.unique(voxel_index, axis=0, return_inverse=True, return_counts=True)
-    centers = np.zeros((len(counts), 3), dtype=np.float64)
-    voxel_colors = np.zeros((len(counts), 3), dtype=np.float64)
-    voxel_visibility = np.zeros((len(counts), visibility.shape[1]), dtype=bool)
-    np.add.at(centers, inverse, points)
-    np.add.at(voxel_colors, inverse, colors)
-    np.logical_or.at(voxel_visibility, inverse, visibility)
-    centers /= counts[:, None]
-    voxel_colors /= counts[:, None]
-    if max_voxels > 0 and len(counts) > max_voxels:
-        keep = np.argsort(counts)[-max_voxels:]
-        centers, voxel_colors, voxel_visibility = (
-            centers[keep], voxel_colors[keep], voxel_visibility[keep]
-        )
-    return centers, np.clip(voxel_colors, 0, 1), voxel_visibility
-
-
 def visualize_visibility(points, colors, visibility, extrinsic, max_voxels,
                          max_rays_per_voxel, ray_length):
     import open3d as o3d
@@ -273,13 +208,13 @@ def parse_args():
     parser.add_argument("--image-resolution", type=int, default=512)
     parser.add_argument("--conf-percentile", type=float, default=20.0)
     parser.add_argument("--depth-edge-rtol", type=float, default=0.03)
-    parser.add_argument("--depth-rel-tol", type=float, default=0.05)
-    parser.add_argument("--depth-abs-tol", type=float, default=0.05)
-    parser.add_argument("--pixel-stride", type=int, default=6)
-    parser.add_argument("--max-vis-points", type=int, default=100000)
-    parser.add_argument("--voxel-size", type=float, default=0.08)
-    parser.add_argument("--point-cloud-voxel-size", type=float, default=0.08,
-                        help="VGGT-space voxel size for the saved pixel->voxel->views index.")
+    parser.add_argument(
+        "--voxel-size", "--point-cloud-voxel-size",
+        dest="voxel_size", type=float, default=0.08,
+        help=("VGGT-space pseudo-voxel size used by the saved "
+              "pixel->voxel->source-views index. The second option name is a "
+              "deprecated compatibility alias."),
+    )
     parser.add_argument("--max-vis-voxels", type=int, default=5000)
     parser.add_argument("--max-rays-per-point", type=int, default=6)
     parser.add_argument("--ray-length", type=float, default=0.25)
@@ -331,7 +266,7 @@ def main():
         predictions["depth"], predictions["extrinsic"], predictions["intrinsic"]
     )
     voxel_cache = build_vggt_voxel_point_cloud(
-        predictions, args.point_cloud_voxel_size, args.conf_percentile,
+        predictions, args.voxel_size, args.conf_percentile,
         args.depth_edge_rtol,
     )
     predictions.update(voxel_cache)

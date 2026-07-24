@@ -174,6 +174,350 @@ class GrapeTrellis:
         scene_views = self.vggt_prediction_to_scene_view[prediction_views]
         return scene_views[scene_views >= 0]
 
+    def visualize_vggt_vacancy_visibility(
+        self,
+        viewpoint_cam,
+        vacancy_mask,
+        max_points=50000,
+        max_voxels=256,
+        max_views_per_voxel=6,
+        ray_length=1.0,
+    ):
+        """Backproject a vacancy with relative depth and draw VGGT source-view rays.
+
+        This is a diagnostic visualization only: relative VGGT depth is combined
+        with Waymo calibration, so the resulting world positions are not metric.
+        """
+        if 'unscaled_depth' not in viewpoint_cam.guidance:
+            print('skip VGGT vacancy visualization: unscaled_depth is unavailable')
+            return
+        if 'vggt_voxel_id' not in viewpoint_cam.guidance:
+            print('skip VGGT vacancy visualization: vggt_voxel_id is unavailable')
+            return
+        if self.view_camera_centers is None:
+            print('skip VGGT vacancy visualization: trellis camera centers are unavailable')
+            return
+
+        depth = viewpoint_cam.guidance['unscaled_depth']
+        voxel_map = viewpoint_cam.guidance['vggt_voxel_id']
+        if torch.is_tensor(depth):
+            depth = depth.detach().cpu().numpy()
+        if torch.is_tensor(voxel_map):
+            voxel_map = voxel_map.detach().cpu().numpy()
+        depth = np.asarray(depth).squeeze()
+        voxel_map = np.asarray(voxel_map).squeeze()
+        vacancy_mask = np.asarray(vacancy_mask, dtype=np.bool_)
+        valid = (
+            vacancy_mask
+            & (voxel_map >= 0)
+            & np.isfinite(depth)
+            & (depth > 0)
+        )
+        ys, xs = np.where(valid)
+        if len(xs) == 0:
+            print('skip VGGT vacancy visualization: no valid vacancy pixels')
+            return
+
+        voxel_ids = voxel_map[ys, xs].astype(np.int64, copy=False)
+        unique_ids, inverse, counts = np.unique(
+            voxel_ids, return_inverse=True, return_counts=True,
+        )
+        if max_voxels > 0 and len(unique_ids) > max_voxels:
+            kept_groups = np.argsort(counts)[-max_voxels:]
+            keep = np.isin(inverse, kept_groups)
+            ys, xs, voxel_ids = ys[keep], xs[keep], voxel_ids[keep]
+            unique_ids = unique_ids[kept_groups]
+
+        K = viewpoint_cam.K
+        if torch.is_tensor(K):
+            K = K.detach().cpu().numpy()
+        K_inv = np.linalg.inv(np.asarray(K, dtype=np.float64))
+        pixels_h = np.stack(
+            [xs, ys, np.ones_like(xs)], axis=-1
+        ).astype(np.float64)
+        camera_points = (pixels_h @ K_inv.T) * depth[ys, xs, None]
+        ref_view = int(viewpoint_cam.id)
+        c2w = np.asarray(self.c2ws[ref_view], dtype=np.float64)
+        world_points = camera_points @ c2w[:3, :3].T + c2w[:3, 3]
+
+        def voxel_color(voxel_id):
+            # Stable pseudo-random color without maintaining a large color table.
+            value = (int(voxel_id) * 2654435761) & 0xffffffff
+            return np.asarray([
+                0.25 + 0.70 * ((value >> 0) & 255) / 255.0,
+                0.25 + 0.70 * ((value >> 8) & 255) / 255.0,
+                0.25 + 0.70 * ((value >> 16) & 255) / 255.0,
+            ])
+
+        colors = np.stack([voxel_color(voxel_id) for voxel_id in voxel_ids])
+        if max_points > 0 and len(world_points) > max_points:
+            keep = np.linspace(0, len(world_points) - 1, max_points).astype(np.int64)
+            display_points, display_colors = world_points[keep], colors[keep]
+        else:
+            display_points, display_colors = world_points, colors
+
+        line_points, line_indices, line_colors = [], [], []
+        for voxel_id in unique_ids:
+            point_mask = voxel_ids == voxel_id
+            if not np.any(point_mask):
+                continue
+            origin = np.median(world_points[point_mask], axis=0)
+            source_views = self.get_vggt_voxel_source_views(voxel_id)
+            if max_views_per_voxel > 0 and len(source_views) > max_views_per_voxel:
+                pick = np.linspace(
+                    0, len(source_views) - 1, max_views_per_voxel
+                ).astype(np.int64)
+                source_views = source_views[pick]
+            color = voxel_color(voxel_id)
+            for source_view in source_views:
+                source_view = int(source_view)
+                if source_view < 0 or source_view >= len(self.view_camera_centers):
+                    continue
+                camera_center = self.view_camera_centers[source_view]
+                if not np.isfinite(camera_center).all():
+                    continue
+                direction = camera_center - origin
+                norm = np.linalg.norm(direction)
+                if norm <= 1e-8:
+                    continue
+                start = len(line_points)
+                line_points.extend((origin, origin + direction / norm * ray_length))
+                line_indices.append((start, start + 1))
+                line_colors.append(color)
+
+        cloud = o3d.geometry.PointCloud()
+        cloud.points = o3d.utility.Vector3dVector(display_points)
+        cloud.colors = o3d.utility.Vector3dVector(display_colors)
+        geometries = [cloud]
+        if line_indices:
+            lines = o3d.geometry.LineSet()
+            lines.points = o3d.utility.Vector3dVector(np.asarray(line_points))
+            lines.lines = o3d.utility.Vector2iVector(np.asarray(line_indices, dtype=np.int32))
+            lines.colors = o3d.utility.Vector3dVector(np.asarray(line_colors))
+            geometries.append(lines)
+        print(
+            f'VGGT vacancy visualization: {len(display_points)} pixels, '
+            f'{len(unique_ids)} pseudo voxels, {len(line_indices)} source rays'
+        )
+        o3d.visualization.draw_geometries(geometries)
+
+    def triangulate_vggt_voxels(
+        self,
+        voxel_ids,
+        viewpoint_cameras,
+        min_views=2,
+        max_reprojection_error=20.0,
+    ):
+        """Triangulate VGGT correspondences with metric Waymo camera rays.
+
+        Each co-visible frame may contain multiple pixels with the same pseudo
+        voxel ID. Their median pixel is used as that frame's observation.
+        """
+        voxel_ids = np.unique(np.asarray(voxel_ids, dtype=np.int64))
+        voxel_ids = voxel_ids[voxel_ids >= 0]
+        cameras_by_id = {int(camera.id): camera for camera in viewpoint_cameras}
+        results = {}
+        identity = np.eye(3, dtype=np.float64)
+
+        # Scan each relevant ID image once. Scanning it once per
+        # (voxel, view) pair is prohibitively expensive for vacancy regions.
+        source_views_by_voxel = {
+            int(voxel_id): self.get_vggt_voxel_source_views(voxel_id)
+            for voxel_id in voxel_ids
+        }
+        relevant_views = sorted({
+            int(view_id)
+            for source_views in source_views_by_voxel.values()
+            for view_id in source_views
+        })
+        observations_by_voxel = defaultdict(list)
+        for view_id in relevant_views:
+            camera = cameras_by_id.get(view_id)
+            if camera is None or 'vggt_voxel_id' not in camera.guidance:
+                continue
+            id_map = camera.guidance['vggt_voxel_id']
+            if torch.is_tensor(id_map):
+                id_map = id_map.detach().cpu().numpy()
+            id_map = np.asarray(id_map).squeeze()
+            selected = np.isin(id_map, voxel_ids)
+            ys, xs = np.where(selected)
+            if len(xs) == 0:
+                continue
+            observed_ids = id_map[ys, xs].astype(np.int64, copy=False)
+            K = camera.K
+            if torch.is_tensor(K):
+                K = K.detach().cpu().numpy()
+            K = np.asarray(K, dtype=np.float64)
+            K_inv = np.linalg.inv(K)
+            c2w = np.asarray(self.c2ws[view_id], dtype=np.float64)
+            for voxel_id in np.unique(observed_ids):
+                same_voxel = observed_ids == voxel_id
+                uv = np.asarray([
+                    np.median(xs[same_voxel]),
+                    np.median(ys[same_voxel]),
+                ], dtype=np.float64)
+                direction_camera = K_inv @ np.asarray([uv[0], uv[1], 1.0])
+                direction_world = c2w[:3, :3] @ direction_camera
+                norm = np.linalg.norm(direction_world)
+                if norm <= 1e-12:
+                    continue
+                observations_by_voxel[int(voxel_id)].append((
+                    view_id,
+                    uv,
+                    c2w[:3, 3].copy(),
+                    direction_world / norm,
+                    K,
+                    c2w,
+                ))
+
+        for voxel_id in voxel_ids:
+            observations = observations_by_voxel[int(voxel_id)]
+
+            if len(observations) < min_views:
+                continue
+
+            # Closest point in least-squares sense to all world-space rays:
+            # sum(I-dd^T) X = sum((I-dd^T) o).
+            lhs = np.zeros((3, 3), dtype=np.float64)
+            rhs = np.zeros(3, dtype=np.float64)
+            for _, _, origin, direction, _, _ in observations:
+                projector = identity - np.outer(direction, direction)
+                lhs += projector
+                rhs += projector @ origin
+            eigenvalues = np.linalg.eigvalsh(lhs)
+            if eigenvalues[-1] <= 1e-12 or eigenvalues[0] / eigenvalues[-1] < 1e-6:
+                continue
+            xyz = np.linalg.solve(lhs, rhs)
+
+            reprojection_errors = []
+            positive_depth = True
+            for _, uv, _, _, K, c2w in observations:
+                w2c = np.linalg.inv(c2w)
+                camera_xyz = xyz @ w2c[:3, :3].T + w2c[:3, 3]
+                if camera_xyz[2] <= 1e-6:
+                    positive_depth = False
+                    break
+                projected = K @ camera_xyz
+                projected_uv = projected[:2] / projected[2]
+                reprojection_errors.append(np.linalg.norm(projected_uv - uv))
+            if not positive_depth:
+                continue
+            median_error = float(np.median(reprojection_errors))
+            if max_reprojection_error > 0 and median_error > max_reprojection_error:
+                continue
+            results[int(voxel_id)] = {
+                'xyz': xyz,
+                'view_ids': np.asarray(
+                    [item[0] for item in observations], dtype=np.int32,
+                ),
+                'uv': np.stack([item[1] for item in observations]),
+                'median_reprojection_error': median_error,
+            }
+        return results
+
+    def visualize_root_and_triangulated_vggt(
+        self,
+        triangulated,
+        max_root_points=100000,
+    ):
+        """Display metric root voxels and triangulated VGGT candidates together."""
+        if not triangulated:
+            print('skip triangulated VGGT visualization: no valid fitted voxels')
+            return
+        root_xyz = np.asarray(self.root_table.points_xyz)
+        if max_root_points > 0 and len(root_xyz) > max_root_points:
+            keep = np.linspace(0, len(root_xyz) - 1, max_root_points).astype(np.int64)
+            root_xyz = root_xyz[keep]
+        root_cloud = o3d.geometry.PointCloud()
+        root_cloud.points = o3d.utility.Vector3dVector(root_xyz)
+        root_cloud.colors = o3d.utility.Vector3dVector(
+            np.full((len(root_xyz), 3), 0.55, dtype=np.float64)
+        )
+
+        voxel_ids = np.asarray(sorted(triangulated), dtype=np.int64)
+        fitted_xyz = np.stack([triangulated[int(i)]['xyz'] for i in voxel_ids])
+        errors = np.asarray([
+            triangulated[int(i)]['median_reprojection_error'] for i in voxel_ids
+        ])
+        normalized_error = errors / max(float(errors.max()), 1e-6)
+        fitted_colors = np.stack(
+            [0.2 + 0.8 * normalized_error,
+             0.9 - 0.7 * normalized_error,
+             np.full_like(normalized_error, 0.15)],
+            axis=-1,
+        )
+        fitted_cloud = o3d.geometry.PointCloud()
+        fitted_cloud.points = o3d.utility.Vector3dVector(fitted_xyz)
+        fitted_cloud.colors = o3d.utility.Vector3dVector(fitted_colors)
+
+        print(
+            f'triangulated VGGT visualization: {len(root_xyz)} root voxels, '
+            f'{len(fitted_xyz)} fitted pseudo voxels; median reprojection error '
+            f'{np.median(errors):.2f}px'
+        )
+        o3d.visualization.draw_geometries(
+            [root_cloud, fitted_cloud],
+            point_show_normal=False,
+        )
+
+    def add_triangulated_vggt_to_vine(self, triangulated, viewpoint_cameras):
+        """Insert metric VGGT triangulations into the trellis vine table."""
+        cameras_by_id = {int(camera.id): camera for camera in viewpoint_cameras}
+        inserted = 0
+        for voxel_id, fit in triangulated.items():
+            xyz = np.asarray(fit['xyz'], dtype=np.float32)
+            voxel_name = self.vine_table.hashcode_point(*xyz)
+            if voxel_name in self.root_table.hash_voxel_id:
+                continue
+
+            visibility = np.zeros(self.N_views, dtype=np.bool_)
+            colors, camera_directions = [], []
+            for view_id, uv in zip(fit['view_ids'], fit['uv']):
+                view_id = int(view_id)
+                if view_id < 0 or view_id >= self.N_views:
+                    continue
+                visibility[view_id] = True
+                camera = cameras_by_id.get(view_id)
+                if camera is not None:
+                    image = camera.original_image
+                    if torch.is_tensor(image):
+                        image = image.detach().cpu().numpy()
+                    image = np.asarray(image)
+                    if image.ndim == 3 and image.shape[0] in (1, 3, 4):
+                        image = np.transpose(image[:3], (1, 2, 0))
+                    x = int(np.clip(np.rint(uv[0]), 0, image.shape[1] - 1))
+                    y = int(np.clip(np.rint(uv[1]), 0, image.shape[0] - 1))
+                    colors.append(image[y, x, :3])
+                direction = np.asarray(self.c2ws[view_id])[:3, 3] - xyz
+                norm = np.linalg.norm(direction)
+                if norm > 1e-8:
+                    camera_directions.append(direction / norm)
+
+            if not np.any(visibility):
+                continue
+            color = (
+                np.mean(colors, axis=0).astype(np.float32)
+                if colors else np.full(3, 0.5, dtype=np.float32)
+            )
+            normal = (
+                np.mean(camera_directions, axis=0).astype(np.float32)
+                if camera_directions else np.asarray([0.0, 0.0, 1.0], dtype=np.float32)
+            )
+            normal_norm = np.linalg.norm(normal)
+            normal = normal / normal_norm if normal_norm > 1e-8 else np.asarray(
+                [0.0, 0.0, 1.0], dtype=np.float32
+            )
+            ray = np.asarray(self.c2ws[int(fit['view_ids'][0])])[:3, 3] - xyz
+            ray_norm = np.linalg.norm(ray)
+            ray = ray / ray_norm if ray_norm > 1e-8 else normal
+            confidence = np.asarray(
+                [1.0 / (1.0 + fit['median_reprojection_error'])], dtype=np.float32
+            )
+            inserted += self.vine_table.push_back(
+                xyz, color, normal, visibility, confidence, ray
+            )
+        return inserted
+
     def get_voxel_center_xyz(self):
         root_xyz = self.root_table.points_xyz
         vine_xyz = self.vine_table.get_xyz()
@@ -287,7 +631,7 @@ class GrapeTrellis:
         mask_visible = np.logical_and(mask_visible, corners_2d[:,0,1] >= 0)
         mask_visible = np.logical_and(mask_visible, corners_2d[:,0,1] < img_H)
         mask_visible = np.logical_and(mask_visible, tmp[:,0,2] > 0.2333)
-        mask_visible = np.logical_and(mask_visible, actor_view_mask) # 遮挡关系. zyk: nuscenes过于稀疏，先这样尝试，后续按visibility应当删除
+        # mask_visible = np.logical_and(mask_visible, actor_view_mask) # 遮挡关系. zyk: nuscenes过于稀疏，先这样尝试，后续按visibility应当删除
 
         # corners_2d = np.round(corners_2d[mask_visible]).astype(int)
         voxel_depth_value, voxel_depth_source = parallel_rasterize(corners_2d[mask_visible], tmp[mask_visible,0,2], img_H, img_W)
@@ -593,83 +937,6 @@ class GrapeTrellis:
         return rots
 
 
-    def generate_vine_voxel_from_depth_propogation(self, viewpoint_cam, propagated_depth, vine_mask, ref_visibility, ref_viewset_diversity_score, ref_gt_image, ref_prop_normal):
-        # 首先拿到所有点。对于root已有pixel（voxel depth有值），过滤；否则记录voxel_xyz和视角信息
-        cam_id = viewpoint_cam.id
-        K = viewpoint_cam.K
-        cam2world = viewpoint_cam.world_view_transform.transpose(0, 1).inverse()
-
-        height, width = propagated_depth.shape
-        y, x = torch.meshgrid(torch.arange(0, height), torch.arange(0, width))
-        coordinates = torch.stack([x.to(propagated_depth.device), y.to(propagated_depth.device), torch.ones_like(propagated_depth)], dim=-1)
-        coordinates_3D = propagated_depth[vine_mask].unsqueeze(1) * (K.inverse() @coordinates[vine_mask].T).T
-        ray_vectors = (cam2world[:3, :3] @ coordinates_3D.T).T
-        world_coordinates_3D = ray_vectors + cam2world[:3, 3]
-
-        u, indices = np.unique(world_coordinates_3D.cpu().detach().numpy() // self.voxel_size, axis=0, return_index=True)
-        # voxel_pos = torch.unique((world_coordinates_3D) // self.voxel_size, dim=0).to(torch.int16).cpu().detach().numpy()
-        for vid in indices:
-            p_xyz = world_coordinates_3D[vid].cpu().detach().numpy() # zyk: turn to tensor cuda later
-            p_color = ref_gt_image[:,vine_mask][:,vid].cpu().detach().numpy()
-            p_normal = ref_prop_normal[:,vine_mask][:,vid].cpu().detach().numpy()
-            p_ray = ray_vectors[vid].cpu().detach().numpy()
-
-            # voxel_name = self.vine_table.hashcode_voxel(vxyz[0], vxyz[1], vxyz[2])
-            voxel_name = self.vine_table.hashcode_point(p_xyz[0], p_xyz[1], p_xyz[2])
-            if voxel_name in self.root_table.hash_voxel_id.keys():
-                # 是否已经在root table中
-                continue
-
-            # 是否已经在vine table中
-            searched_ray_nbr = False
-            # 其实应当有在2D上投影重叠但3D中并不重叠的情况
-            # 在视角方向上寻找数格，若需要其他视角voxel则认为是重叠（root-vine-vine-root联结方案）。搜寻长度以diversity score为基准。
-            
-            # 需要对置信度有所更改
-            ray_nbr = voxel_traversal(p_xyz - p_ray*0.1, p_xyz + p_ray*0.1, self.voxel_size)
-            for i,j,k in ray_nbr:
-                nbr_name = self.vine_table.hashcode_voxel(i,j,k)
-                if nbr_name in self.root_table.hash_voxel_id:
-                    break
-
-                if nbr_name in self.vine_table.hash_voxel_table_id:
-                    # nbr = self.vine_table.get_xyz(nbr_name)
-                    nbr_idx = self.vine_table.hash_voxel_table_id[nbr_name]
-                    searched_ray_nbr = True
-                    if self.vine_table.view_diversity[nbr_idx] > ref_viewset_diversity_score: # vine-vine联结判别方案可继续累加，如必须同向视角才可替代、如必须视角diversity足够才可增删，etc
-                        # 若nbr置信度足够大，则直接认为当前vine是落在nbr上的
-                        self.vine_table.add_observation(nbr_name, ref_visibility, ref_viewset_diversity_score, p_ray)
-                    else:
-                        # 若新生vine置信度反而大于nbr，则将nbr移动并合并到当前vine
-                        self.vine_table.add_observation(nbr_name, ref_visibility, ref_viewset_diversity_score, p_ray)
-                        self.vine_table.points_xyz[nbr_idx] = p_xyz
-                        self.vine_table.hash_voxel_table_id.pop(nbr_name)
-                        self.vine_table.hash_voxel_table_id[voxel_name] = nbr_idx
-                    break
-    
-            if not searched_ray_nbr:
-                # current_voxel = self.vine_table.spawn_voxel(voxel_name)
-                # current_voxel.add_observation(ref_visibility, ref_viewset_diversity_score, ray_vec)
-                self.vine_table.push_back(p_xyz, p_color, p_normal, ref_visibility, ref_viewset_diversity_score, p_ray) # right?
-
-
-
-# class VineVoxel:
-#     def __init__(self, name):
-#         self.name = name 
-#         self.visibility = None
-#         self.viewset_diversity = -1
-#         self.ray_vector = None
-
-#     def add_observation(self, visibility, diversity_score, ray_vector):
-#         if self.visibility is None:
-#             self.visibility = np.zeros(visibility.shape).astype(np.bool_)
-#         self.visibility = np.logical_or(self.visibility, visibility)
-#         if self.viewset_diversity < diversity_score:
-#             self.viewset_diversity = diversity_score
-#             self.ray_vector = ray_vector
-
-
 class VineTable:
     def __init__(self, min_bound, max_bound, N_views=597, voxel_size=0.15):
         self.voxel_size = voxel_size
@@ -680,13 +947,13 @@ class VineTable:
         self.hash_voxel_table_id = defaultdict(list)
 
         self.CAPACITY = 2048
-        self.points_xyz = np.zeros([self.CAPACITY, 3]).astype(np.float16)
-        self.points_color = np.zeros([self.CAPACITY, 3]).astype(np.float16)   # or np.float?
-        self.points_normal = np.zeros([self.CAPACITY, 3]).astype(np.float16)
+        self.points_xyz = np.zeros([self.CAPACITY, 3], dtype=np.float32)
+        self.points_color = np.zeros([self.CAPACITY, 3], dtype=np.float32)
+        self.points_normal = np.zeros([self.CAPACITY, 3], dtype=np.float32)
         
         self.points_visibility = np.zeros([self.CAPACITY, N_views]).astype(np.bool_)
-        self.points_ray_vector = np.zeros([self.CAPACITY, 3]).astype(np.float16)
-        self.view_diversity = np.zeros([self.CAPACITY, 1]).astype(np.float16)
+        self.points_ray_vector = np.zeros([self.CAPACITY, 3], dtype=np.float32)
+        self.view_diversity = np.zeros([self.CAPACITY, 1], dtype=np.float32)
 
         self.valid_cnt = 0 # xxx[:valid_cnt] for query
     #     self.last_updated_cnt = 0
@@ -697,18 +964,6 @@ class VineTable:
 
     #     self.last_updated_cnt = self.valid_cnt
 
-    def add_observation(self, voxel_name, ref_visibility, ref_viewset_diversity_score, ray_vector):
-        idx = -1
-        if voxel_name in self.hash_voxel_table_id:
-            idx = self.hash_voxel_table_id[voxel_name]
-            if idx < 0 or idx >= self.valid_cnt:
-                return None
-            
-        self.points_visibility[idx] = np.logical_or(self.points_visibility[idx], ref_visibility)
-        if self.view_diversity[idx] < ref_viewset_diversity_score:
-            self.view_diversity[idx] = ref_viewset_diversity_score
-            self.points_ray_vector[idx] = ray_vector
-    
     def get_xyz(self, voxel_name=None):
         if voxel_name is None:
             return self.points_xyz[:self.valid_cnt]
@@ -741,22 +996,36 @@ class VineTable:
         new_ray_vector = new_ray_vector.reshape(-1, 3)
 
         num_new_points = new_xyz.shape[0]
-        if self.valid_cnt + num_new_points > self.CAPACITY:
+        while self.valid_cnt + num_new_points > self.CAPACITY:
             self._double_resize()
 
+        inserted = 0
         for i in range(num_new_points):
             name = self.hashcode_point(new_xyz[i,0], new_xyz[i,1], new_xyz[i,2])
-            if name not in self.hash_voxel_table_id:
+            if name in self.hash_voxel_table_id:
+                idx = self.hash_voxel_table_id[name]
+                self.points_visibility[idx] = np.logical_or(
+                    self.points_visibility[idx], new_visibility[i]
+                )
+                if self.view_diversity[idx, 0] < new_view_diversity[i, 0]:
+                    self.points_xyz[idx] = new_xyz[i]
+                    self.points_color[idx] = new_color[i]
+                    self.points_normal[idx] = new_normal[i]
+                    self.points_ray_vector[idx] = new_ray_vector[i]
+                    self.view_diversity[idx] = new_view_diversity[i]
+            else:
                 self.hash_voxel_table_id[name] = self.valid_cnt
 
-                self.points_xyz[self.valid_cnt] = new_xyz
-                self.points_color[self.valid_cnt] = new_color # float? int?
-                self.points_normal[self.valid_cnt] = new_normal
-                self.points_visibility[self.valid_cnt] = new_visibility
-                self.points_ray_vector[self.valid_cnt] = new_ray_vector
-                self.view_diversity[self.valid_cnt] = new_view_diversity
+                self.points_xyz[self.valid_cnt] = new_xyz[i]
+                self.points_color[self.valid_cnt] = new_color[i]
+                self.points_normal[self.valid_cnt] = new_normal[i]
+                self.points_visibility[self.valid_cnt] = new_visibility[i]
+                self.points_ray_vector[self.valid_cnt] = new_ray_vector[i]
+                self.view_diversity[self.valid_cnt] = new_view_diversity[i]
 
                 self.valid_cnt += 1
+                inserted += 1
+        return inserted
 
 
     def _double_resize(self):
@@ -770,7 +1039,7 @@ class VineTable:
 
 
     def _enlarge_and_copy(self, x, size):
-        new_x = np.zeros([size, x.shape[1]]) 
+        new_x = np.zeros([size, x.shape[1]], dtype=x.dtype)
         new_x[:self.valid_cnt] = x[:self.valid_cnt]
         return new_x
 
@@ -907,48 +1176,3 @@ def point_in_2d_triangle(x, y, triangle_vertices):
     P20 = (x2 - x) * (y0 - y) - (x0 - x) * (y2 - y)
     
     return (P01 > 0 and P12 > 0 and P20 > 0) or (P01 < 0 and P12 < 0 and P20 < 0)
-
-
-
-def voxel_traversal(P0, P1, voxel_size):
-    x0, y0, z0 = P0
-    x1, y1, z1 = P1
-    dx, dy, dz = x1 - x0, y1 - y0, z1 - z0
-    
-    # 步进方向
-    stepX = 1 if dx > 0 else -1
-    stepY = 1 if dy > 0 else -1
-    stepZ = 1 if dz > 0 else -1
-    
-    # 初始体素索引
-    i = int(x0 // voxel_size)
-    j = int(y0 // voxel_size)
-    k = int(z0 // voxel_size)
-    end_i = int(x1 // voxel_size)
-    end_j = int(y1 // voxel_size)
-    end_k = int(z1 // voxel_size)
-    
-    # 边界距离初始化
-    tMaxX = (voxel_size * (i + (stepX > 0)) - x0) / dx if dx != 0 else float('inf')
-    tMaxY = (voxel_size * (j + (stepY > 0)) - y0) / dy if dy != 0 else float('inf')
-    tMaxZ = (voxel_size * (k + (stepZ > 0)) - z0) / dz if dz != 0 else float('inf')
-    
-    tDeltaX = voxel_size / abs(dx) if dx != 0 else float('inf')
-    tDeltaY = voxel_size / abs(dy) if dy != 0 else float('inf')
-    tDeltaZ = voxel_size / abs(dz) if dz != 0 else float('inf')
-    
-    voxels = [(i, j, k)]
-    # while (i, j, k) != (end_i, end_j, end_k):
-    total_steps = (abs(end_i - i) + abs(end_j - j) + abs(end_k - k)) + 3
-    for _ in range(total_steps):
-        if tMaxX < tMaxY and tMaxX < tMaxZ:
-            i += stepX
-            tMaxX += tDeltaX
-        elif tMaxY < tMaxZ:
-            j += stepY
-            tMaxY += tDeltaY
-        else:
-            k += stepZ
-            tMaxZ += tDeltaZ
-        voxels.append((i, j, k))
-    return voxels

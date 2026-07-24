@@ -730,15 +730,7 @@ def densify_bkgd_by_viewpoint(randidx, gt_image, optim_args, dataset, gaussians,
                 propagated_mask = propagated_mask & ~obj_bound[0]
 
 
-            propogated_vine_mask = np.logical_and(propagated_mask.cpu().detach().numpy(), obj_mask)
-            propogated_vine_mask = np.logical_and(propogated_vine_mask, voxel_depth_source==-1)
-
-            if propogated_vine_mask.sum() > 100  and  viewset_diversity_score > view_diversity_threshold:
-                ref_visibility = np.zeros([len(viewpoint_stack)]).astype(np.bool_)
-                ref_visibility[ref_src_views[0]] = True
-                grape_trellis.generate_vine_voxel_from_depth_propogation(viewpoint_cam, propagated_depth, propogated_vine_mask, ref_visibility, viewset_diversity_score, gt_image, normal) # normal from prop or pred?
-
-            print("depth_propagation", i, "/", len(vacancy_colors), "finished, view", randidx, "points", propogated_vine_mask.sum())
+            print("depth_propagation", i, "/", len(vacancy_colors), "finished, view", randidx)
 
         # grape_trellis.visualize_root_and_vine()
             # if propagated_mask.sum() > 100:
