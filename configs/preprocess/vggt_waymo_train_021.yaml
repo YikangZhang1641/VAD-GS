@@ -1,0 +1,13 @@
+parent_cfg: configs/example/waymo_train_021.yaml
+
+data:
+  vggt_predictions: predictions.npz
+  vggt_prediction_generation:
+    vggt_root: /home/zyk/Ext/Projects/support/vggt-omega
+    checkpoint: /home/zyk/Ext/Projects/support/vggt-omega/checkpoints/vggt_omega_1b_512.pt
+    device: cuda
+    image_resolution: 512
+    conf_percentile: 20.0
+    depth_edge_rtol: 0.03
+    relative_voxel_size: 0.01
+    visualize: false

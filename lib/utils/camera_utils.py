@@ -9,6 +9,7 @@ from tqdm import tqdm
 from lib.utils.general_utils import PILtoTorch, NumpytoTorch, matrix_to_quaternion
 from lib.utils.graphics_utils import fov2focal, getProjectionMatrix, getWorld2View2, getProjectionMatrixK
 from lib.datasets.base_readers import CameraInfo
+from lib.datasets.vggt_prediction_io import resize_vggt_voxel_ids
 from lib.config import cfg
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 
@@ -103,7 +104,9 @@ class Camera(nn.Module):
     def set_device(self, device):
         self.original_image = self.original_image.to(device)
         for k, v in self.guidance.items():
-            self.guidance[k] = v.to(device, non_blocking=True)
+            # Offline ID maps index the CPU-resident VGGT visibility table.
+            if k != 'vggt_voxel_id':
+                self.guidance[k] = v.to(device, non_blocking=True)
 
         
 class MiniCam:
@@ -132,6 +135,8 @@ def loadguidance(guidance, resolution): # 这里不载入cuda是因为全部装�
             new_guidance['obj_bound'] = PILtoTorch(v, resolution, resize_mode=Image.NEAREST).bool()
         elif k == 'lidar_depth':
             new_guidance['lidar_depth'] = NumpytoTorch(v, resolution, resize_mode=Image.NEAREST).float()
+        elif k == 'vggt_voxel_id':
+            new_guidance[k] = torch.from_numpy(resize_vggt_voxel_ids(v, resolution))
         elif k== 'dynamic_mask':
             new_guidance['dynamic_mask'] = NumpytoTorch(v, resolution, resize_mode=Image.NEAREST).int()
         elif k=="mono_depth":

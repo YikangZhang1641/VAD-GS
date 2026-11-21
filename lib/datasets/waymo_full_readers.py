@@ -2,6 +2,7 @@ from lib.utils.waymo_utils import generate_dataparser_outputs
 from lib.utils.graphics_utils import focal2fov, BasicPointCloud
 from lib.utils.data_utils import get_val_frames
 from lib.datasets.base_readers import CameraInfo, SceneInfo, getNerfppNorm, fetchPly, get_PCA_Norm, get_Sphere_Norm
+from lib.datasets.vggt_prediction_io import load_vggt_predictions, add_vggt_camera_guidance
 from lib.config import cfg
 from tqdm import tqdm
 from PIL import Image
@@ -66,6 +67,9 @@ def readWaymoFullInfo(path, images='images', split_train=-1, split_test=-1, **kw
     poses = output['poses']
     c2ws = output['c2ws']
     image_filenames = output['image_filenames']
+    vggt_predictions, vggt_voxel_info = load_vggt_predictions(
+        path, image_filenames, cfg.data.vggt_predictions,
+    )
     obj_tracklets = output['obj_tracklets']
     obj_info = output['obj_info']
     frames, cams = output['frames'], output['cams']
@@ -96,6 +100,7 @@ def readWaymoFullInfo(path, images='images', split_train=-1, split_test=-1, **kw
     scene_metadata['obj_view_dict'] = obj_view_dict
     scene_metadata['c2ws'] = c2ws
     scene_metadata['ixts'] = ixts
+    scene_metadata['vggt_voxel_info'] = vggt_voxel_info
     
 
     camera_timestamps = dict()
@@ -142,6 +147,9 @@ def readWaymoFullInfo(path, images='images', split_train=-1, split_test=-1, **kw
             camera_timestamps[cams[i]]['test_timestamps'].append(cams_timestamps[i])
         
         guidance = dict()
+        add_vggt_camera_guidance(
+            guidance, image_name, width, height, vggt_predictions, vggt_voxel_info,
+        )
 
         # load dynamic mask
         if load_dynamic_mask:

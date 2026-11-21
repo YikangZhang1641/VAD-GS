@@ -39,7 +39,7 @@ train:
 
 optim:
   hard_depth_start: 0
-  soft_depth_start: 1000
+  hard_depth_end: 24000
   error_tolerance: 0.01
 
   prune_box_interval: 100
@@ -57,8 +57,6 @@ optim:
   propagated_iteration_begin: 0 # 1000
   propagated_iteration_after: 10000
   propagation_interval: 29
-
-  hard_depth_start: 0
 
   feature_lr: 0.0025
   max_screen_size: 20
@@ -90,6 +88,16 @@ optim:
   track_rotation_lr_init: 0.001
   track_rotation_lr_final: 1.0e-5
   track_rotation_max_steps: 30000
+
+  # voxel DN vision
+  normal_loss: True
+  use_voxel_depth: True
+  
+  # origin lidar depth supervision
+  use_lidar_depth: False
+
+  # view selection
+  skip_view_selection: False
 
 
 render:

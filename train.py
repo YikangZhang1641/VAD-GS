@@ -32,6 +32,15 @@ import queue
 
 marker_queue = queue.Queue()
 
+from lib.datasets.vggt_prediction_io import (
+    add_vggt_camera_guidance,
+    get_vggt_pixel_source_views,
+    get_vggt_voxel_source_views,
+    load_vggt_predictions,
+    resize_vggt_voxel_ids,
+)
+# from lib.datasets.vggt_prediction_io import get_vggt_pixel_source_views
+
 ############################
 import gc
 import shutil
@@ -457,8 +466,9 @@ def training():
 
                 if dynamic_mask is not None:
                     propagated_mask = propagated_mask & ~torch.any(dynamic_mask != 255, axis=0)
-
-                if propagated_mask.sum() > 100:
+                
+                # 这一部分补点要考虑，是否一直在反复补充同一区域特定部分，而另一部分始终未补充且导致检测缺失。
+                if propagated_mask.sum() > 100: 
                     K = viewpoint_cam.K
                     cam2target = viewpoint_cam.world_view_transform.transpose(0, 1).inverse()
                     bkgd_count = gaussians.background.get_xyz.shape[0]
@@ -838,11 +848,6 @@ def training():
         Ll1 = l1_loss(image, gt_image, mask=loss_mask)
         scalar_dict['l1_loss'] = Ll1.item()
         loss = (1.0 - optim_args.lambda_dssim) * optim_args.lambda_l1 * Ll1 + optim_args.lambda_dssim * (1.0 - ssim(image, gt_image, mask=loss_mask))
-
-        # shape_pena = (gaussians.get_scaling.max(dim=1).values / gaussians.get_scaling.min(dim=1).values).mean()
-        # scale_pena = ((gaussians.get_scaling.max(dim=1, keepdim=True).values)**2).mean()
-        # loss_reg = optim_args.lambda_shape_pena*shape_pena + optim_args.lambda_scale_pena*scale_pena
-        # loss += loss_reg
 
 
         # sky loss

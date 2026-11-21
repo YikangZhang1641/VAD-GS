@@ -83,6 +83,54 @@ For training:
 python train.py --config configs/example/nuscenes_train_000.yaml
 ```
 
+Optional offline VGGT-Omega pixel visibility (VADT `98540b1`): place a compact
+`predictions.npz` in the scene's `source_path`, or set `data.vggt_predictions` to
+an absolute path or a path relative to `source_path`. An empty value disables
+loading; a missing file leaves the lookup unavailable. Waymo and DriveStudio
+readers load the pixel-to-voxel map into camera guidance and the voxel-to-view
+table into `dataset.scene_info.metadata["vggt_voxel_info"]`, independently of
+initial point-cloud generation. Existing point-cloud caches need no rebuild.
+The lookup requires neither LiDAR/COLMAP points nor online VGGT inference:
+
+```python
+from lib.datasets.vggt_prediction_io import get_vggt_pixel_source_views
+
+camera = viewpoint_full_stack[view_id]
+view_ids = get_vggt_pixel_source_views(
+    camera, dataset.scene_info.metadata["vggt_voxel_info"], u=100, v=200,
+)
+```
+
+Pixels use the current camera image resolution; crop, resize and padding are
+handled when loading camera guidance. Invalid pixels return an empty array.
+Returned IDs index the selected scene views (frame + camera, including any test
+views); filter to training views if needed. They represent views contributing to
+the same VGGT pseudo-voxel, with accuracy limited by voxel size. VGGT coordinates
+remain in their own scale and do not initialize or modify the scene point cloud.
+
+To generate this cache offline, use the migrated VADT generator with an
+experiment configuration plus `data.vggt_prediction_generation` settings.
+Two preprocessing configurations inherit the training examples, so their
+`source_path`, selected frames and cameras stay aligned:
+
+```bash
+# From the VAD-GS repository root; validate inputs without loading the model.
+python script/generate_vggt_visibility.py --config configs/preprocess/vggt_waymo_train_021.yaml --dry-run
+
+# Run once in the existing VGGT-Omega inference environment.
+conda run -n playground python script/generate_vggt_visibility.py --config configs/preprocess/vggt_waymo_train_021.yaml
+conda run -n playground python script/generate_vggt_visibility.py --config configs/preprocess/vggt_nuscenes_train_000.yaml
+```
+
+Set `vggt_root` and `checkpoint` under `data.vggt_prediction_generation` for a
+different installation. Generation uses only this offline configuration and
+does not start an online worker. It requires images and binary sky masks
+(`sky_mask/` or `sky_masks/`, nonzero means sky), and writes the path specified
+by `data.vggt_predictions` (default: `source_path/predictions.npz`). Existing
+caches require `--overwrite` to replace. Visualization is disabled by default;
+set `visualize: true` for an Open3D preview. `relative_voxel_size` is measured
+relative to the median valid VGGT depth, matching VADT's current exporter.
+
 To generate visual outputs:
 ```
 python render.py --config configs/example/nuscenes_train_000.yaml mode evaluate
