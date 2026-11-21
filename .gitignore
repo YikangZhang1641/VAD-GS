@@ -1,4 +1,5 @@
 output/
+
 data/*
 notebooks/*
 !notebooks/waymo_converter.ipynb
@@ -10,3 +11,4 @@ build/
 *.egg-info
 log_gpu.py
 make_ply.py
+*.pyc

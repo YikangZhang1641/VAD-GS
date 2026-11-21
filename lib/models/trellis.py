@@ -11,7 +11,6 @@ from numba import njit, prange
 from lib.utils.sh_utils import RGB2SH, IDFT
 from lib.utils.general_utils import inverse_sigmoid, get_expon_lr_func, quaternion_to_matrix, quaternion_raw_multiply
 from scipy.spatial.transform import Rotation as R
-import copy
 
 
 class GrapeTrellis:
@@ -177,7 +176,7 @@ class GrapeTrellis:
     #     return voxel_depth_value, voxel_depth_source, bkgd_positions[mask_visible], bkgd_colors[mask_visible]
 
 
-    def render_voxel_depth(self, current_view, img_H, img_W, obj_rots=None, obj_trans=None):
+    def render_voxel_depth(self, current_view, img_H, img_W, K, obj_rots=None, obj_trans=None):
         actor_positions = self.get_voxel_center_xyz()
         actor_colors = self.get_voxel_color()
         actor_view_mask = self.get_visibility()[:, current_view]
@@ -201,11 +200,8 @@ class GrapeTrellis:
         view_pos_world_voxel_corners = np.concatenate([view_pos_world_voxel_corners, np.ones_like(view_pos_world_voxel_corners[..., :1])], axis=-1)
         view_pos_cam = view_pos_world_voxel_corners @ np.linalg.inv(self.c2ws[current_view]).T
 
-        # self.ixts[current_view].T #viewpoint_cam.K.cpu().detach().numpy().T
-        # scale = 960/1920 # waymo
-        scale = 960/1600 # Nuscenes
-        K = copy.deepcopy(self.ixts[current_view])
-        K[:2] *= scale        
+        # Use the current camera intrinsics, already scaled to the training image.
+        K = K.detach().cpu().numpy()
         
         tmp = view_pos_cam[...,:3] @ K.T
         # tmp = (xyzs_obj[:, None, :].repeat(8,1) + self.ctr2corners) @ self.ixts[current_view].T #viewpoint_cam.K.cpu().detach().numpy().T

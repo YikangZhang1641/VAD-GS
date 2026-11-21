@@ -231,7 +231,7 @@ def training():
 
         current_view, img_H, img_W = randidx, gt_image.shape[1], gt_image.shape[2]
         if "bkgd_voxel" not in viewpoint_cam.guidance: # zyk: fixed here, not growing for now.
-            voxel_depth_value, voxel_depth_source, mask_visible, uvs = gaussians.background.grape_trellis.render_voxel_depth(current_view, img_H, img_W)
+            voxel_depth_value, voxel_depth_source, mask_visible, uvs = gaussians.background.grape_trellis.render_voxel_depth(current_view, img_H, img_W, K=viewpoint_cam.K)
             viewpoint_cam.guidance["bkgd_voxel"] = (voxel_depth_value.astype(np.float16), voxel_depth_source.astype(np.int32), mask_visible, uvs.astype(np.int16))
         
 
@@ -674,7 +674,7 @@ def training():
                     obj_rots = quaternion_to_matrix(obj_rot)
                     obj_trans = ego_pose[:3, :3] @ obj_trans + ego_pose[:3, 3]
 
-                    voxel_depth_value, voxel_depth_source, mask_visible, uvs = obj_model.grape_trellis.render_voxel_depth(current_view, img_H, img_W, obj_rots, obj_trans)
+                    voxel_depth_value, voxel_depth_source, mask_visible, uvs = obj_model.grape_trellis.render_voxel_depth(current_view, img_H, img_W, K=viewpoint_cam.K, obj_rots=obj_rots, obj_trans=obj_trans)
                     if mask_visible.sum() < 10:
                         continue
                     # 过低的 point_obs_ratio 可能没有输出。按逻辑而言需要在此处加入更新voxel部分
