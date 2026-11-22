@@ -35,7 +35,7 @@ train:
 
 optim:
   propagated_iteration_begin: 1000
-  propagated_iteration_after: 10000
+  propagated_iteration_end: 10000
   
   prune_box_interval: 100
   densification_interval: 100

@@ -683,7 +683,7 @@ def densify_bkgd_by_viewpoint(randidx, gt_image, optim_args, dataset, gaussians,
             abs_rel_error = torch.abs(propagated_depth - rendered_depth) / propagated_depth
             depth_error_max_threshold = 1.0
             depth_error_min_threshold = 0.8
-            abs_rel_error_threshold = depth_error_max_threshold - (depth_error_max_threshold - depth_error_min_threshold) * (iteration - optim_args.propagated_iteration_begin) / (optim_args.propagated_iteration_after - optim_args.propagated_iteration_begin)
+            abs_rel_error_threshold = depth_error_max_threshold - (depth_error_max_threshold - depth_error_min_threshold) * (iteration - optim_args.propagated_iteration_begin) / (optim_args.propagated_iteration_end - optim_args.propagated_iteration_begin)
             # color error
             # render_color = render_pkg['rgb']
             # color_error = torch.abs(render_color - viewpoint_cam.original_image)

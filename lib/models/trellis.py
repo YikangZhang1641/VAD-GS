@@ -11,6 +11,7 @@ from numba import njit, prange
 from lib.utils.sh_utils import RGB2SH, IDFT
 from lib.utils.general_utils import inverse_sigmoid, get_expon_lr_func, quaternion_to_matrix, quaternion_raw_multiply
 from scipy.spatial.transform import Rotation as R
+from lib.datasets.vggt_prediction_io import get_vggt_voxel_source_views
 
 
 class GrapeTrellis:
@@ -359,6 +360,81 @@ class GrapeTrellis:
         ref_src_views = self.greedy_sample_src_views_by_ref_points(rootvine_xyz, current_view, mask_visible, point_obs_ratio=point_obs_ratio, N=4)
         view_diversity = self.calculate_belief_views(rootvine_xyz, ref_src_views)
         return ref_src_views, view_diversity, rootvine_xyz
+
+    def sample_viewset_from_vggt_mask(self, current_view, obj_mask, viewpoint_cam,
+                                    voxel_info, point_obs_ratio=0.8, N=4,
+                                    allowed_view_ids=None):
+        """Select reference + up to N sources from a pixel region without XYZ.
+
+        Coverage counts mask pixels sharing VGGT pseudo-voxels with each view.
+        Diversity is the RMS camera baseline perpendicular to the reference
+        pixel rays, divided by the scene camera span. This dimensionless score
+        measures baseline diversity without requiring target depths or points;
+        it has a different scale from calculate_belief_views().
+        """
+        ref_src_views = [int(current_view)]
+        pixel_ids = viewpoint_cam.guidance.get('vggt_voxel_id')
+        if voxel_info is None or pixel_ids is None or N <= 0:
+            return ref_src_views, 0.0
+        if torch.is_tensor(pixel_ids):
+            pixel_ids = pixel_ids.detach().cpu().numpy()
+        if torch.is_tensor(obj_mask):
+            obj_mask = obj_mask.detach().cpu().numpy()
+        obj_mask = np.asarray(obj_mask, dtype=np.bool_)
+        if obj_mask.shape != pixel_ids.shape:
+            raise ValueError('Object mask and VGGT pixel indices must have the same HxW shape')
+        num_voxels = len(voxel_info['vggt_voxel_source_offsets']) - 1
+        valid_mask = obj_mask & (pixel_ids >= 0) & (pixel_ids < num_voxels)
+        voxel_ids, pixel_counts = np.unique(pixel_ids[valid_mask], return_counts=True)
+        if not len(voxel_ids):
+            return ref_src_views, 0.0
+
+        centers = np.asarray(self.c2ws[:, :3, 3], dtype=np.float64)
+        coverage = np.zeros(len(centers), dtype=np.float64)
+        for voxel_id, count in zip(voxel_ids, pixel_counts):
+            views = get_vggt_voxel_source_views(voxel_info, voxel_id)
+            coverage[views] += count
+        candidates = np.flatnonzero((coverage > 0) &
+                                   (coverage >= coverage.max() * point_obs_ratio))
+        candidates = candidates[candidates != current_view]
+        if allowed_view_ids is not None:
+            candidates = candidates[np.isin(candidates, allowed_view_ids)]
+        camera_span = np.linalg.norm(np.ptp(centers, axis=0))
+        if not len(candidates) or camera_span <= 1e-12:
+            return ref_src_views, 0.0
+
+        # Reference pixel rays supply directions, without assuming any depth.
+        y, x = np.nonzero(valid_mask)
+        K = viewpoint_cam.K
+        if torch.is_tensor(K):
+            K = K.detach().cpu().numpy()
+        rays = np.column_stack((x, y, np.ones_like(x))) @ np.linalg.inv(K).T
+        rays = rays @ self.c2ws[current_view, :3, :3].T
+        rays /= np.linalg.norm(rays, axis=1, keepdims=True)
+        ray_covariance = rays.T @ rays / len(rays)
+
+        def baseline_diversity(view_a, view_b):
+            baseline = centers[view_a] - centers[view_b]
+            squared_length = np.sum(baseline * baseline, axis=-1)
+            squared_along_ray = np.einsum('...i,ij,...j->...', baseline, ray_covariance, baseline)
+            return np.sqrt(np.maximum(squared_length - squared_along_ray, 0.0)) / camera_span
+
+        # Greedy farthest-view selection, weighted by region coverage.
+        for _ in range(min(N, len(candidates))):
+            diversity = baseline_diversity(candidates[:, None], np.asarray(ref_src_views)[None, :])
+            priority = diversity.min(axis=1) * coverage[candidates] / pixel_counts.sum()
+            best = int(np.argmax(priority))
+            if not np.isfinite(priority[best]) or priority[best] <= 1e-12:
+                break
+            ref_src_views.append(int(candidates[best]))
+            candidates = np.delete(candidates, best)
+
+        if len(ref_src_views) < 2:
+            return ref_src_views, 0.0
+        selected = np.asarray(ref_src_views)
+        pair_scores = baseline_diversity(selected[:, None], selected[None, :])
+        view_diversity = float(np.median(pair_scores[np.triu_indices(len(selected), k=1)]))
+        return ref_src_views, view_diversity
 
     def visualize_viewset(self, ref_src_views, rootvine_xyz, bkgd_positions_visibile, bkgd_colors_visibile):
         # 补充视角可视化，定性评估视角多元化置信度指标
