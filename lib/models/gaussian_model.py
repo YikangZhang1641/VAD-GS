@@ -637,7 +637,7 @@ class GaussianModel(nn.Module):
         world_coordinates_3D = (cam2target[:3, :3] @ coordinates_3D.T).T + cam2target[:3, 3]
         world_coordinates_3D = world_coordinates_3D.view(height, width, 3)
         
-        propagated_normal_cam = -propagated_normal[[0,2,1], :, :].permute(1,2,0).view(-1, 3)
+        propagated_normal_cam = propagated_normal.permute(1,2,0).view(-1, 3)
         world_normal = (cam2target[:3, :3] @ propagated_normal_cam.T).T
         world_normal = world_normal.view(height, width, 3)
 

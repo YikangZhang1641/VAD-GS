@@ -507,6 +507,8 @@ def training():
                         # use_trellis = mask_visible_obj.sum() >= 10
                         use_trellis = USE_TRELLIS
                         if use_trellis:
+                            if mask_visible_obj.sum() < 10:
+                                continue
                             ref_src_views, viewset_diversity_score, _ = gaussians.background.grape_trellis.sample_viewset_from_obj_mask(
                                 current_view, mask_visible_obj, point_obs_ratio=0.5, N=4)
                         else:
@@ -562,11 +564,6 @@ def training():
                         color_error = color_error.mean(dim=0).squeeze()
                         #for waymo, quantile 0.6; for free dataset, quantile 0.4
                         error_mask = (abs_rel_error > abs_rel_error_threshold)
-                        if not use_trellis:
-                            # Empty renders provide no depth prior. Still require
-                            # valid PatchMatch depths and multiview consistency.
-                            missing_prior = (voxel_depth_tensor == 0) & (acc[0] < 0.9)
-                            error_mask &= ~missing_prior
                         
                         # calculate the geometric consistency
                         ref_K = viewpoint_cam.K

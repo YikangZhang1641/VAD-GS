@@ -11,6 +11,7 @@ import matplotlib.pyplot as plt
 import subprocess
 from random import randint
 import patchmatch_cuda
+from lib.config import cfg
 
 def write_cam_txt(cam_path, K, w2c, depth_range):
     with open(cam_path, "w") as file:
@@ -454,13 +455,11 @@ def depth_propagation(current_view, src_idxs, rendered_depth, rendered_normals, 
         torch.save({"image_tensors":image_tensors, "mask_tensors":mask_tensors, "camera_tensors":camera_tensors, "depth_tensor":depth_tensor, "anchor_depth_tensor":anchor_depth_tensor, "normal_guess_tensor":normal_guess_tensor}, "./text.pth")
         depth_out, cost_out, normal_out = None, None, None
 
-    # 0627 tmp zyk  Nuscenes
-    nuscenes_tmp = normal_out.clone()
-    nuscenes_tmp[:,:,0]=normal_out[:,:,0]
-    nuscenes_tmp[:,:,1]=-normal_out[:,:,2]
-    nuscenes_tmp[:,:,2]=normal_out[:,:,1]
+    # 1122 坐标校正。waymo 已确认，nuscenes尚未测试
+    R_ref = ref_ext[:3, :3].to(normal_out)
+    normal_out = normal_out @ R_ref.T
 
-    return depth_out, cost_out, nuscenes_tmp
+    return depth_out, cost_out, normal_out
 
 #############################################################################
 

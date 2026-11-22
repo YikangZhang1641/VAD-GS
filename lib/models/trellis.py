@@ -12,7 +12,7 @@ from lib.utils.sh_utils import RGB2SH, IDFT
 from lib.utils.general_utils import inverse_sigmoid, get_expon_lr_func, quaternion_to_matrix, quaternion_raw_multiply
 from scipy.spatial.transform import Rotation as R
 from lib.datasets.vggt_prediction_io import get_vggt_voxel_source_views
-
+from lib.config import cfg
 
 class GrapeTrellis:
     def __init__(self, points_xyz, points_rgb, points_normal, points_visibility, voxel_size = 0.15):
@@ -213,8 +213,10 @@ class GrapeTrellis:
         mask_visible = np.logical_and(corners_2d[:,0,0] >= 0, corners_2d[:,0,0] < img_W)
         mask_visible = np.logical_and(mask_visible, corners_2d[:,0,1] >= 0)
         mask_visible = np.logical_and(mask_visible, corners_2d[:,0,1] < img_H)
-        mask_visible = np.logical_and(mask_visible, tmp[:,0,2] > 0.2333)
-        mask_visible = np.logical_and(mask_visible, actor_view_mask) # 遮挡关系. zyk: nuscenes过于稀疏，先这样尝试，后续按visibility应当删除
+        mask_visible = np.logical_and(mask_visible, tmp[:,0,2] > 0.01)
+        if cfg.data.type == 'DriveStudio':  # 当前 nuScenes 配置使用的类型
+            mask_visible = np.logical_and(mask_visible, tmp[:,0,2] > 0.2333)
+            mask_visible = np.logical_and(mask_visible, actor_view_mask) # 遮挡关系. zyk: nuscenes过于稀疏，先这样尝试，后续按visibility应当删除
 
         # corners_2d = np.round(corners_2d[mask_visible]).astype(int)
         voxel_depth_value, voxel_depth_source = parallel_rasterize(corners_2d[mask_visible], tmp[mask_visible,0,2], img_H, img_W)
