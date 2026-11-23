@@ -176,7 +176,9 @@ def readWaymoFullInfo(path, images='images', split_train=-1, split_test=-1, **kw
             
         # load sky mask
         if load_sky_mask:
-            sky_mask_path = os.path.join(sky_mask_dir, f'{image_name[3:]}.png')
+            sky_mask_path = os.path.join(sky_mask_dir, f'{image_name}.png')
+            if not os.path.isfile(sky_mask_path):
+                sky_mask_path = os.path.join(sky_mask_dir, f'{image_name[3:]}.png')
             sky_mask = (cv2.imread(sky_mask_path)[..., 0]) > 0.
             guidance['sky_mask'] = Image.fromarray(sky_mask)
 

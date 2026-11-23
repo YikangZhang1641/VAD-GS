@@ -57,7 +57,7 @@ def load_camera_info(datadir):
     
     ego_frame_poses = []
     ego_cam_poses = [[] for i in range(5)]
-    ego_pose_paths = sorted(os.listdir(ego_pose_dir))
+    ego_pose_paths = sorted(name for name in os.listdir(ego_pose_dir) if name.endswith(".txt"))
     for ego_pose_path in ego_pose_paths:
         
         # frame pose
@@ -910,8 +910,8 @@ def generate_dataparser_outputs(
 
         # combine SfM pointcloud with LiDAR pointcloud
         try:
+            points_colmap_mask = np.ones(points_colmap_xyz.shape[0], dtype=np.bool_)
             if cfg.data.filter_colmap:
-                points_colmap_mask = np.ones(points_colmap_xyz.shape[0], dtype=np.bool_)
                 for i, ext in enumerate(exts):
                     # if frames_idx[i] not in train_frames:
                     #     continue
@@ -927,6 +927,10 @@ def generate_dataparser_outputs(
                 points_colmap_xyz = points_colmap_xyz[points_colmap_mask]
                 points_colmap_rgb = points_colmap_rgb[points_colmap_mask]
                 
+            colmap_view_to_scene_view = {
+                f'cam_{cam}/{frame:06d}.png': view_id
+                for view_id, (frame, cam) in enumerate(zip(frames, cams))
+            }
             for p3d_colmap_id in range(len(points_colmap_tracks)):
                 if not points_colmap_mask[p3d_colmap_id]:
                     continue
@@ -941,9 +945,7 @@ def generate_dataparser_outputs(
                     point2d_id = p_tracks[track_id][1] 
                     v, u = colmap_images[colmap_view_id].xys[point2d_id].astype(np.int16)
                     
-                    _cam_id = (colmap_view_id - 1) // num_frames
-                    _stamp_id = (colmap_view_id - 1) % num_frames
-                    _my_view_id = _stamp_id * num_cameras + _cam_id
+                    _my_view_id = colmap_view_to_scene_view[colmap_images[colmap_view_id].name]
 
                     p_n = normals_world_all[_my_view_id][u, v]
                     # xyzs_voxel.append(   points_colmap_xyz[p3d_colmap_id])

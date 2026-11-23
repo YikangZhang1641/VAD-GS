@@ -9,7 +9,7 @@ data:
   white_background: true
   selected_frames: [0, 160]
   cameras: [0]
-  use_tracker: true
+  use_tracker: false
   extent: 20
   use_colmap: true
 
@@ -30,8 +30,16 @@ train:
   checkpoint_iterations: [30000]
 
 optim:
+  hard_depth_start: 0
+  hard_depth_end: 24000
+  normal_loss: true
+  use_voxel_depth: true
+  use_lidar_depth: false
+  skip_view_selection: false
+
   propagated_iteration_begin: 1000
   propagated_iteration_end: 10000
+  propagation_interval: 5
   
   prune_box_interval: 100
   densification_interval: 100

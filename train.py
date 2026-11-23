@@ -249,11 +249,6 @@ def training():
             image = soft_render_pkg["rgb"]
             _similarity = ssim(image, gt_image, mask=loss_mask)
             if _similarity < 0.8:
-            # if _similarity > 0.8:
-            #     continue
-
-                # ssim(image, gt_image, mask=loss_mask)
-                # loss_hard = 0
 
                 hard_render_pkg = gaussians_renderer.render(viewpoint_cam, gaussians, render_type="hard_depth")
                 hard_depth = hard_render_pkg["depth"][0]
@@ -267,25 +262,7 @@ def training():
                 if m1.sum() > (voxel_depth_tensor > 0).sum() * 0.2:
                     flag_local_reconstruct = True
 
-                # m2 = (voxel_depth_tensor > 0) & (hard_depth < voxel_depth_tensor * 0.9) # objects occluded
-                # mask = m1 | m2
 
-                # if optim_args.lambda_depth_lidar > 0 and lidar_depth is not None:            
-                #     depth_error = torch.abs((hard_depth[mask] - voxel_depth_tensor[mask]))
-                #     voxel_depth_loss = depth_error.mean()
-
-                #     loss_hard += optim_args.lambda_depth_lidar * voxel_depth_loss
-                        
-
-                # patch_range = (min(hard_depth.shape[1], hard_depth.shape[2]) // 20, max(hard_depth.shape[1], hard_depth.shape[2]) // 10) # zyk: to be tuned
-                # mono_depth[sky_mask] = mono_depth[~sky_mask].mean() # zyk: check if works?
-                # hard_depth[sky_mask] = hard_depth[~sky_mask].mean().detach()
-
-                # loss_l2_dpt = patch_norm_mse_loss(hard_depth[None,...], mono_depth[None,...], randint(patch_range[0], patch_range[1]), optim_args.error_tolerance)
-                # loss_hard += 0.1 * loss_l2_dpt
-
-                # loss_global = patch_norm_mse_loss_global(hard_depth[None,...], mono_depth[None,...], randint(patch_range[0], patch_range[1]), optim_args.error_tolerance)
-                # loss_hard += 1 * loss_global
 
                 acc = soft_render_pkg['acc']
 
@@ -311,29 +288,6 @@ def training():
                     v = obj_acc[actor_mask].kthvalue(k).values
                     if v.item() < 0.7:
                         flag_actor_reconstruct = True
-
-
-                # if flag_global_reconstruct or flag_local_reconstruct or flag_actor_reconstruct:
-                #     check_history = 10
-                #     check_interval = 0
-                
-                # if check_history > 0:
-                #     check_history -= 1
-                # else:
-                #     check_interval += 1
-                #     check_interval = min(check_interval, 19)
-
-                # acc = torch.clamp(acc, min=1e-6, max=1.-1e-6)
-                # sky_loss = torch.where(sky_mask, -torch.log(1 - acc), -torch.log(acc)).mean()
-
-                # loss_hard.backward()
-
-
-                # # Optimizer step
-                # if iteration < training_args.iterations:                
-                #     gaussians.update_optimizer()
-
-
 
 
         with torch.no_grad():
@@ -658,11 +612,7 @@ def training():
 
                     gaussians.set_visibility(include_list)
                     gaussians.parse_camera(viewpoint_cam)
-                    # render_pkg_obj = gaussians_renderer.render_object(viewpoint_cam, gaussians, parse_camera_again=True)
-                    # render_color = render_pkg_obj['rgb']
-                    # rendered_depth = render_pkg_obj['depth'][0]
-                    # rendered_normal = render_pkg_obj['normals']
-                    # render_acc = render_pkg_obj['acc']
+                    # obj_render_pkg = gaussians_renderer.render_object(viewpoint_cam, gaussians, parse_camera_again=True)
 
                     render_color = obj_render_pkg['rgb']
                     rendered_depth = obj_render_pkg['depth'][0]

@@ -470,8 +470,8 @@ class StreetGaussianModel(nn.Module):
             normals_obj_local = obj_model.get_normals(camera) # [N, 3]
                     
             obj_rot = self.actor_pose.get_tracking_rotation(track_id, self.viewpoint_camera)
-            # obj_rot = quaternion_to_matrix(obj_rot.unsqueeze(0)).squeeze(0)
             obj_rot = quaternion_to_matrix(obj_rot).squeeze(0)
+            obj_rot = self.viewpoint_camera.ego_pose[:3, :3] @ obj_rot # codex检查出的对齐错误。是否确定？
             
             normals_obj_global = normals_obj_local @ obj_rot.T
             normals_obj_global = torch.nn.functional.normalize(normals_obj_global)                

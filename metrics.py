@@ -63,8 +63,10 @@ def evaluate(split='test'):
             image_name = cam_info.image_name
             render_path = test_dir / method / f'{image_name}_rgb.png'
             gt_path = test_dir / method / f'{image_name}_gt.png'
-            # obj_bound_path = os.path.join(dataset.source_path, "dynamic_mask_15", f'{image_name}.png')
-            obj_bound_path = os.path.join(dataset.source_path, "dynamic_masks/all", f'{image_name}.png')
+            if cfg.data.type == 'Waymo':
+                obj_bound_path = os.path.join(dataset.source_path, "dynamic_mask_15", f'{image_name}.png')
+            else:
+                obj_bound_path = os.path.join(dataset.source_path, "dynamic_masks/all", f'{image_name}.png')
             
             render = Image.open(render_path)
             gt = Image.open(gt_path)
