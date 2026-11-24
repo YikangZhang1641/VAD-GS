@@ -718,12 +718,12 @@ class GaussianModel(nn.Module):
         )
 
 
-        import open3d as o3d
-        point_cloud = o3d.geometry.PointCloud()
-        point_cloud.points = o3d.utility.Vector3dVector(world_coordinates_3D_downsampled.detach().cpu().numpy())
-        point_cloud.colors = o3d.utility.Vector3dVector(color_downsampled.cpu().detach().numpy())
-        FOR1 = o3d.geometry.TriangleMesh.create_coordinate_frame(size=5, origin=[0, 0, 0])
-        o3d.visualization.draw_geometries([point_cloud, FOR1])
+        # import open3d as o3d
+        # point_cloud = o3d.geometry.PointCloud()
+        # point_cloud.points = o3d.utility.Vector3dVector(world_coordinates_3D_downsampled.detach().cpu().numpy())
+        # point_cloud.colors = o3d.utility.Vector3dVector(color_downsampled.cpu().detach().numpy())
+        # FOR1 = o3d.geometry.TriangleMesh.create_coordinate_frame(size=5, origin=[0, 0, 0])
+        # o3d.visualization.draw_geometries([point_cloud, FOR1])
 
 
 
@@ -736,13 +736,13 @@ class GaussianModel(nn.Module):
 
         original_point_cloud = self.get_xyz
 
-        import open3d as o3d
-        point_cloud_origin = o3d.geometry.PointCloud()
-        point_cloud_origin.points = o3d.utility.Vector3dVector(original_point_cloud.detach().cpu().numpy())
-        point_cloud_origin.colors = o3d.utility.Vector3dVector(np.ones_like(original_point_cloud.detach().cpu().numpy()) * 0.7)
+        # import open3d as o3d
+        # point_cloud_origin = o3d.geometry.PointCloud()
+        # point_cloud_origin.points = o3d.utility.Vector3dVector(original_point_cloud.detach().cpu().numpy())
+        # point_cloud_origin.colors = o3d.utility.Vector3dVector(np.ones_like(original_point_cloud.detach().cpu().numpy()) * 0.7)
 
-        FOR1 = o3d.geometry.TriangleMesh.create_coordinate_frame(size=5, origin=[0, 0, 0])
-        o3d.visualization.draw_geometries([point_cloud, point_cloud_origin, FOR1])
+        # FOR1 = o3d.geometry.TriangleMesh.create_coordinate_frame(size=5, origin=[0, 0, 0])
+        # o3d.visualization.draw_geometries([point_cloud, point_cloud_origin, FOR1])
 
 
 

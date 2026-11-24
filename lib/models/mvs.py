@@ -287,7 +287,7 @@ def vggt_region_has_missing_depth(obj_mask, ref_camera, ref_depth, voxel_info,
             if view_id not in source_depth_cache:
                 rendered = renderer.render(camera, gaussians)
                 acc = rendered['acc'][0]
-                depth = rendered['depth'][0] / acc.clamp_min(1e-6)
+                depth = rendered['depth'][0] #/ acc.clamp_min(1e-6)
                 valid = torch.isfinite(depth) & (depth > 0) & (acc > 0.5)
                 sky = camera.guidance.get('sky_mask')
                 dynamic = camera.guidance.get('dynamic_mask')

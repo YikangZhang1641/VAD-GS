@@ -22,6 +22,8 @@ import cv2
 from lib.models.trellis import parallel_rasterize
 from lib.models.street_gaussian_model import quaternion_raw_multiply, matrix_to_quaternion, quaternion_to_matrix
 from lib.models.mvs import densify_bkgd_by_viewpoint, vggt_region_has_missing_depth, get_actor_pose_world
+from lib.datasets.vggt_prediction_io import get_vggt_pixel_source_views
+from densification import reconstruct_global, reconstruct_local, reconstruct_actor
 ############################
 import time
 import matplotlib.pyplot as plt
@@ -199,8 +201,8 @@ def training():
             viewpoint_stack = scene.getTrainCameras().copy()
             view_stack_iter += 1
         # only for debug. 后续关闭
-        viewpoint_cam = viewpoint_full_stack[143]
-        # viewpoint_cam: Camera = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
+        # viewpoint_cam = viewpoint_full_stack[143]
+        viewpoint_cam: Camera = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
         randidx = viewpoint_cam.id
         
         gt_image = viewpoint_cam.original_image
@@ -276,8 +278,8 @@ def training():
                 if v.item() < 0.9:
                     flag_local_reconstruct = True
 
-                gaussians.set_visibility(include_list)
-                gaussians.parse_camera(viewpoint_cam)
+                # gaussians.set_visibility(include_list)
+                # gaussians.parse_camera(viewpoint_cam)
                 obj_render_pkg = gaussians_renderer.render_object(viewpoint_cam, gaussians) #, parse_camera_again=True)
                 obj_acc = obj_render_pkg["acc"]
 
@@ -294,152 +296,12 @@ def training():
 
 ######################################################## BACKGROUND CONTINUOUS ###############################################################################
             if flag_global_reconstruct:
-                visibility = gaussians.background.grape_trellis.get_visibility()
-                # src_idxs = [randidx+itv*cams_per_frame for itv in [-2, -1, 1, 2] if ((itv*cams_per_frame + randidx > 0) and (itv*cams_per_frame + randidx < FULL_STACK_LENGTH))] # 随机选一个视角，与前后2帧作patch matching
-                src_idxs = []
-                
-                pre = randidx - cams_per_frame
-                while pre >= 0 and visibility[:, pre].sum() == 0:
-                    pre -= cams_per_frame
-                if pre >= 0:
-                    src_idxs.append(pre)
-
-                pre -= cams_per_frame
-                while pre >= 0 and visibility[:, pre].sum() == 0:
-                    pre -= cams_per_frame
-                if pre >= 0:
-                    src_idxs.append(pre)
-
-                post = randidx + cams_per_frame
-                while post < FULL_STACK_LENGTH and visibility[:, post].sum() == 0:
-                    post += cams_per_frame
-                if post < FULL_STACK_LENGTH:
-                    src_idxs.append(post)
-
-                post += cams_per_frame
-                while post < FULL_STACK_LENGTH and visibility[:, post].sum() == 0:
-                    post += cams_per_frame
-                if post < FULL_STACK_LENGTH:
-                    src_idxs.append(post)        
-                # only for debug. 后续关闭
-                soft_render_pkg = gaussians_renderer.render(viewpoint_cam, gaussians) #, render_type="hard_depth")
-                
-                # rendered_depth = render_pkg['depth'][0]
-                # rendered_normal = render_pkg['normals']
-                # radii = render_pkg["radii"]
-
-                rendered_depth = soft_render_pkg['depth'][0] 
-                rendered_normal = soft_render_pkg['normals']
-
-                # get the propagated depth
-                # depth_propagation_old(randidx, src_idxs, rendered_depth.detach().cpu().numpy(), rendered_normal.detach().cpu().numpy().transpose(1,2,0), viewpoint_full_stack, dataset, vehicle_name=None, patch_size=20)
-                propagated_depth, cost, propagated_normal = depth_propagation(randidx, src_idxs, rendered_depth, rendered_normal, viewpoint_full_stack, dataset, vehicle_name=None, patch_size=20)
-
-                # propagated_depth_old, cost_old, normal_old = read_propagted_depth('./cache/propagated_depth')
-                # cost = torch.tensor(cost).to(rendered_depth.device)
-                # normal = torch.tensor(normal).to(rendered_depth.device)
-                # #transform normal to camera coordinate
-                # # R_w2c = torch.tensor(viewpoint_cam.R.T).cuda().to(torch.float32)
-                # # # R_w2c[:, 1:] *= -1
-                # # normal = (R_w2c @ normal.view(-1, 3).permute(1, 0)).view(3, viewpoint_cam.image_height, viewpoint_cam.image_width)                
-                propagated_normal = (propagated_normal.view(-1, 3).permute(1, 0)).view(3, viewpoint_cam.image_height, viewpoint_cam.image_width)                
-                
-                # propagated_depth = torch.tensor(propagated_depth).to(rendered_depth.device)
-                valid_mask = propagated_depth != 300
-
-                # calculate the abs rel depth error of the propagated depth and rendered depth & render color error
-                abs_rel_error = torch.abs(propagated_depth - rendered_depth) / propagated_depth.clamp_min(1e-6)
-                depth_error_max_threshold = 1.0
-                depth_error_min_threshold = 0.8
-                abs_rel_error_threshold = depth_error_max_threshold - (depth_error_max_threshold - depth_error_min_threshold) * (iteration - optim_args.propagated_iteration_begin) / (optim_args.propagated_iteration_end - optim_args.propagated_iteration_begin)
-                # color error
-                render_color = soft_render_pkg['rgb']
-
-                color_error = torch.abs(render_color - gt_image)
-                color_error = color_error.mean(dim=0).squeeze()
-                #for waymo, quantile 0.6; for free dataset, quantile 0.4
-                error_mask = (abs_rel_error > abs_rel_error_threshold)
-                
-                # calculate the geometric consistency
-                ref_K = viewpoint_cam.K
-                ref_pose = viewpoint_cam.world_view_transform.transpose(0, 1).inverse()
-                geometric_counts = None
-                # for idx, src_idx in enumerate(src_idxs):
-                for idx in range(len(src_idxs)):
-                    src_idx = src_idxs[idx]
-                    src_viewpoint = viewpoint_full_stack[src_idx]
-                    #c2w
-                    src_pose = src_viewpoint.world_view_transform.transpose(0, 1).inverse()
-                    src_K = src_viewpoint.K
-
-                    src_render_pkg = gaussians_renderer.render(src_viewpoint, gaussians) #, render_type="hard_depth")
-                    src_rendered_depth = src_render_pkg['depth'][0]
-                    src_rendered_normal = src_render_pkg['normals']
-
-                    #get the src_depth first
-                    # depth_propagation(src_viewpoint, torch.zeros_like(src_projected_depth).cuda(), viewpoint_stack, src_idxs, opt.dataset, opt.patch_size)
-                    src_idxs_for_src = src_idxs[:idx] + src_idxs[idx + 1:] + [randidx]
-                    # depth_propagation(src_idx, src_idxs_for_src, src_rendered_depth.detach().cpu().numpy(), src_rendered_normal.detach().cpu().numpy().transpose(1,2,0), viewpoint_full_stack, dataset, vehicle_name=None, patch_size=20)
-                    src_depth, src_cost, src_normal = depth_propagation(src_idx, src_idxs_for_src, src_rendered_depth, src_rendered_normal, viewpoint_full_stack, dataset, vehicle_name=None, patch_size=20)
-                    
-                    # src_depth, cost, src_normal = read_propagted_depth('./cache/propagated_depth')
-                    # src_depth = torch.tensor(src_depth).cuda()
-                    mask, depth_reprojected, x2d_src, y2d_src, relative_depth_diff = check_geometric_consistency(propagated_depth.unsqueeze(0), ref_K.unsqueeze(0), 
-                                                                                                                    ref_pose.unsqueeze(0), src_depth.unsqueeze(0), 
-                                                                                                                    src_K.unsqueeze(0), src_pose.unsqueeze(0), thre1=2, thre2=0.01)
-                    if geometric_counts is None:
-                        geometric_counts = mask.to(torch.uint8)
-                    else:
-                        geometric_counts += mask.to(torch.uint8)
-                        
-                cost = geometric_counts.squeeze() # 这里cost大约代表各视角下共享视野的部分，越高代表被共同观测且匹配成功的视角越多
-                # cost_mask = cost >= 2
-                cost_mask = cost >= len(src_idxs)*0.5 # 0.75
-                
-                #set -10 as nan              
-                update_mask = (cost_mask & ~torch.any(dynamic_mask != 255, axis=0)).unsqueeze(0).repeat(3, 1, 1)
-                # normal[update_mask] = -10
-                # viewpoint_cam.guidance['mono_normal'][update_mask] = normal[update_mask] #.cpu()
-                mono_normal[update_mask] = propagated_normal[update_mask] #.cpu()
-
-                propagated_mask = valid_mask & ~error_mask & cost_mask # propagation有值 & 由渲染获得的D误差足够大 & 被多个视角共同观测 
-                if sky_mask is not None:
-                    propagated_mask = propagated_mask & ~sky_mask[0]
-
-                # if obj_bound is not None:
-                #     propagated_mask = propagated_mask & ~obj_bound[0]
-
-                if dynamic_mask is not None:
-                    propagated_mask = propagated_mask & ~torch.any(dynamic_mask != 255, axis=0)
-                
-                # 这一部分补点要考虑，是否一直在反复补充同一区域特定部分，而另一部分始终未补充且导致检测缺失。
-                if propagated_mask.sum() > 100: 
-                    K = viewpoint_cam.K
-                    cam2target = viewpoint_cam.world_view_transform.transpose(0, 1).inverse()
-                    bkgd_count = gaussians.background.get_xyz.shape[0]
-                    # if bkgd_count < N_bkgd_init:
-                    #     target_count = propagated_mask.sum() // 4 # min(propagated_mask.sum(), 1000)
-                    # elif bkgd_count < N_bkgd_init*2:
-                    #     target_count = propagated_mask.sum() // 16 # min(propagated_mask.sum() // 4, 800)
-                    # elif bkgd_count < N_bkgd_init*4:
-                    #     target_count = propagated_mask.sum() // 64 # min(propagated_mask.sum() // 16, 400)
-                    # else:
-                    #     target_count = propagated_mask.sum() // 256 # min(propagated_mask.sum() // 64, 200)
-                    if bkgd_count < 1e6:
-                        target_count = propagated_mask.sum()  # min(propagated_mask.sum() // 4, 800)
-                    elif bkgd_count < 2e6:
-                        target_count = propagated_mask.sum() // 4 # min(propagated_mask.sum() // 16, 400)
-                    else:
-                        target_count = propagated_mask.sum() // 16 # min(propagated_mask.sum() // 64, 200)
-                    # only for debug. 后续关闭
-                    acc = soft_render_pkg['acc']
-                    gaussians.background.densify_from_depth_propagation(K, cam2target, propagated_depth, propagated_normal, propagated_mask.to(torch.bool), acc, gt_image, init_opacity=0.1, target_count=target_count) 
-                
+                mono_normal = viewpoint_cam.guidance['mono_normal'] = reconstruct_global(viewpoint_cam, viewpoint_full_stack, dataset, gaussians, gaussians_renderer,
+                       cams_per_frame, iteration, optim_args, gt_image, sky_mask, dynamic_mask, mono_normal, soft_render_pkg)
 
 ##################################### BACKGROUND DISCIRETE ##########################################################
             if flag_local_reconstruct and not optim_args.skip_view_selection: #  or iteration > FULL_STACK_LENGTH * 5 and iteration < FULL_STACK_LENGTH * 20 and (iteration % optim_args.propagation_interval == 0):
 
-                # voxel_depth_value, voxel_depth_source, mask_visible, uvs = gaussians.background.grape_trellis.render_voxel_depth(current_view, img_H, img_W)
                 voxel_depth_value, voxel_depth_source, mask_visible, uvs = viewpoint_cam.guidance["bkgd_voxel"]
                 
                 segment_img = seg_bkgd_mask.cpu().detach().numpy().transpose(1,2,0)
@@ -508,118 +370,15 @@ def training():
                                 or viewset_diversity_score < DIVERSITY_THRES):
                             continue
 
-                        src_idxs = ref_src_views[1:]
-
-                        # depth_propagation(randidx, src_idxs, rendered_depth.detach().cpu().numpy(), rendered_normal.detach().cpu().numpy().transpose(1,2,0), viewpoint_full_stack, dataset, vehicle_name=None, patch_size=20)
-                        propagated_depth, cost, propagated_normal = depth_propagation(randidx, src_idxs, rendered_depth, rendered_normal, viewpoint_full_stack, dataset, vehicle_name=None, patch_size=20)
-
-                        # propagated_depth, cost, normal = read_propagted_depth('./cache/propagated_depth')
-                        # cost = torch.tensor(cost).to(rendered_depth.device)
-                        # normal = torch.tensor(normal).to(rendered_depth.device)
-                        # # #transform normal to camera coordinate
-                        # # R_w2c = torch.tensor(viewpoint_cam.R.T).cuda().to(torch.float32)
-                        # # # R_w2c[:, 1:] *= -1
-                        # # normal = (R_w2c @ normal.view(-1, 3).permute(1, 0)).view(3, viewpoint_cam.image_height, viewpoint_cam.image_width)                
-                        propagated_normal = (propagated_normal.view(-1, 3).permute(1, 0)).view(3, viewpoint_cam.image_height, viewpoint_cam.image_width)                
-                        
-                        propagated_depth = propagated_depth.to(rendered_depth.device)
-                        valid_mask = torch.isfinite(propagated_depth) & (propagated_depth > 0) & (propagated_depth != 300)
-
-                        # calculate the abs rel depth error of the propagated depth and rendered depth & render color error
-                        render_depth = soft_render_pkg['depth'][0]
-                        abs_rel_error = torch.abs(propagated_depth - render_depth) / propagated_depth.clamp_min(1e-6)
-                        depth_error_max_threshold = 1.0
-                        depth_error_min_threshold = 0.8
-                        abs_rel_error_threshold = depth_error_max_threshold - (depth_error_max_threshold - depth_error_min_threshold) * (iteration - optim_args.propagated_iteration_begin) / (optim_args.propagated_iteration_end - optim_args.propagated_iteration_begin)
-                        # color error
-                        render_color = soft_render_pkg['rgb']
-
-                        color_error = torch.abs(render_color - gt_image)
-                        color_error = color_error.mean(dim=0).squeeze()
-                        #for waymo, quantile 0.6; for free dataset, quantile 0.4
-                        error_mask = (abs_rel_error > abs_rel_error_threshold)
-                        
-                        # calculate the geometric consistency
-                        ref_K = viewpoint_cam.K
-                        ref_pose = viewpoint_cam.world_view_transform.transpose(0, 1).inverse()
-                        geometric_counts = None
-
-                        for idx in range(len(src_idxs)):
-                            src_idx = src_idxs[idx]
-                            src_viewpoint = viewpoint_full_stack[src_idx]
-                            #c2w
-                            src_pose = src_viewpoint.world_view_transform.transpose(0, 1).inverse()
-                            src_K = src_viewpoint.K
-
-                            src_render_pkg = gaussians_renderer.render(src_viewpoint, gaussians) #, render_type="hard_depth")
-                            src_rendered_depth = src_render_pkg['depth'][0]
-                            src_rendered_normal = src_render_pkg['normals']
-
-                            #get the src_depth first
-                            src_idxs_for_src = src_idxs[:idx] + src_idxs[idx + 1:] + [randidx]
-                            # depth_propagation(src_idx, src_idxs_for_src, src_rendered_depth.detach().cpu().numpy(), src_rendered_normal.detach().cpu().numpy().transpose(1,2,0), viewpoint_full_stack, dataset, vehicle_name=None, patch_size=20)
-                            src_depth, cost, src_normal = depth_propagation(src_idx, src_idxs_for_src, src_rendered_depth, src_rendered_normal, viewpoint_full_stack, dataset, vehicle_name=None, patch_size=20)
-                            
-                            # src_depth, cost, src_normal = read_propagted_depth('./cache/propagated_depth')
-                            # src_depth = torch.tensor(src_depth).cuda()
-                            mask, depth_reprojected, x2d_src, y2d_src, relative_depth_diff = check_geometric_consistency(propagated_depth.unsqueeze(0), ref_K.unsqueeze(0), 
-                                                                                                                            ref_pose.unsqueeze(0), src_depth.unsqueeze(0), 
-                                                                                                                            src_K.unsqueeze(0), src_pose.unsqueeze(0), thre1=2, thre2=0.01)
-                            if geometric_counts is None:
-                                geometric_counts = mask.to(torch.uint8)
-                            else:
-                                geometric_counts += mask.to(torch.uint8)
-                                
-                        cost = geometric_counts.squeeze() # 这里cost大约代表各视角下共享视野的部分，越高代表被共同观测且匹配成功的视角越多
-                        # cost_mask = cost >= 2
-                        cost_mask = cost >= len(src_idxs)*0.5 #0.75
-                        
-                        #set -10 as nan     
-                        update_mask = (cost_mask & valid_mask & torch.from_numpy(obj_mask).to(cost_mask.device)).unsqueeze(0).repeat(3, 1, 1)
-                        # normal[~(cost_mask.unsqueeze(0).repeat(3, 1, 1))] = -10
-                        mono_normal[update_mask] = propagated_normal[update_mask] #.cpu()
-                        
-                        propagated_mask = valid_mask & ~error_mask & cost_mask # propagation有值 & 由渲染获得的D误差足够大 & 被多个视角共同观测 
-                        if sky_mask is not None:
-                            propagated_mask = propagated_mask & ~sky_mask[0]
-
-                        if dynamic_mask is not None:
-                            propagated_mask = propagated_mask & torch.all(dynamic_mask == 255, axis=0)
-                        
-                        obj_mask = torch.from_numpy(np.all(segment_img==c, axis=2)).cuda()
-                        propagated_mask = propagated_mask & obj_mask
-                        
-                        if propagated_mask.sum() > 100:
-                            K = viewpoint_cam.K
-                            cam2target = viewpoint_cam.world_view_transform.transpose(0, 1).inverse()
-                            bkgd_count = gaussians.background.get_xyz.shape[0]
-                            # if bkgd_count < N_bkgd_init:
-                            #     target_count = propagated_mask.sum() // 4  #min(propagated_mask.sum(), 1000)
-                            # elif bkgd_count < N_bkgd_init * 2:
-                            #     target_count = propagated_mask.sum() // 16 #min(propagated_mask.sum() // 4, 800)
-                            # elif bkgd_count < N_bkgd_init * 4:
-                            #     target_count = propagated_mask.sum() // 64 #min(propagated_mask.sum() // 16, 500)
-                            # else:
-                            #     target_count = propagated_mask.sum() // 256 #min(propagated_mask.sum() // 64, 200)
-
-                            if bkgd_count < 1e6:
-                                target_count = propagated_mask.sum()
-                            elif bkgd_count < 2e6:
-                                target_count = propagated_mask.sum() // 4
-                            else:
-                                target_count = propagated_mask.sum() // 16
-                            # only for debug. 后续关闭
-                            acc = soft_render_pkg['acc']
-                            gaussians.background.densify_from_depth_propagation(K, cam2target, propagated_depth, propagated_normal, propagated_mask.to(torch.bool), acc, gt_image, init_opacity=0.3, target_count=target_count) 
-
+                        mono_normal = viewpoint_cam.guidance['mono_normal'] = reconstruct_local(
+                            ref_src_views, viewpoint_cam, viewpoint_full_stack, dataset, gaussians,
+                            gaussians_renderer, mono_normal, soft_render_pkg, reconstruction_mask=obj_mask,
+                            iteration=iteration, optim_args=optim_args, gt_image=gt_image,
+                            sky_mask=sky_mask, dynamic_mask=dynamic_mask)
 
 
 ##################################################### OBJECT #######################################################################################
             if flag_actor_reconstruct and not optim_args.skip_view_selection: # or iteration > FULL_STACK_LENGTH * 0 and iteration < FULL_STACK_LENGTH * 20 and (iteration % optim_args.propagation_interval == 0):
-
-                            
-                # Step1: render foreground
-
                 for dynamic_key in torch.unique(dynamic_mask):
                     if dynamic_key == 255:
                         continue
@@ -628,11 +387,7 @@ def training():
                     obj_name = "obj_%.3d"%dynamic_id
                     if obj_name not in include_list:
                         continue
-
-                    # render_pkg_obj = gaussians_renderer.render(viewpoint_cam, gaussians, exclude_list=["background"], render_type="hard_depth")
-
-                    gaussians.set_visibility(gaussians.obj_list)
-                    gaussians.parse_camera(viewpoint_cam)
+                    
                     obj_render_pkg = gaussians_renderer.render_object(viewpoint_cam, gaussians)
 
                     render_color = obj_render_pkg['rgb']
@@ -651,7 +406,6 @@ def training():
                     obj_acc = render_acc[:, obj_mask]
                     if (obj_acc < 0.5).sum() < (obj_acc > 0.9).sum() * 0.1:
                         continue
-
 
                     track_id = obj_model.track_id
                     obj_views = dataset.scene_info.metadata["obj_view_dict"][track_id]
@@ -672,123 +426,12 @@ def training():
                     if len(ref_src_views) <= 4 or viewset_diversity_score < DIVERSITY_THRES:
                         continue
 
-                    # vehicle_name = None
-                    vehicle_name = int(obj_name.split("_")[-1])
+                    # 视角已在上方选定，重建函数只负责传播、法线更新和加点。
+                    mono_normal = viewpoint_cam.guidance['mono_normal'] = reconstruct_actor(
+                        ref_src_views, dynamic_id, viewpoint_cam, viewpoint_full_stack, dataset, gaussians,
+                        gaussians_renderer, iteration, optim_args, gt_image,
+                        sky_mask, dynamic_mask, mono_normal, obj_render_pkg)
 
-                    src_idxs = ref_src_views[1:]
-                    # get the propagated depth
-                    # depth_propagation(randidx, src_idxs, rendered_depth.detach().cpu().numpy(), rendered_normal.detach().cpu().numpy().transpose(1,2,0), viewpoint_full_stack, dataset, vehicle_name=vehicle_name, patch_size=20)
-                    propagated_depth, cost, propagated_normal = depth_propagation(randidx, src_idxs, rendered_depth, rendered_normal, viewpoint_full_stack, dataset, vehicle_name=vehicle_name, patch_size=20, actor_pose=gaussians.actor_pose)
-                    if propagated_depth is None:
-                        print("no props")
-                        continue 
-
-                    # propagated_depth, cost, propagated_normal = read_propagted_depth('./cache/propagated_depth')
-                    # cost = torch.tensor(cost).to(rendered_depth.device)
-                    # normal = torch.tensor(normal).to(rendered_depth.device)
-                    # #transform normal to camera coordinate
-                    # R_w2c = torch.tensor(viewpoint_cam.R.T).cuda().to(torch.float32)
-                    # # R_w2c[:, 1:] *= -1
-                    # normal = (R_w2c @ normal.view(-1, 3).permute(1, 0)).view(3, viewpoint_cam.image_height, viewpoint_cam.image_width)                
-                    propagated_normal = (propagated_normal.view(-1, 3).permute(1, 0)).view(3, viewpoint_cam.image_height, viewpoint_cam.image_width)                
-                    
-                    # propagated_depth = propagated_depth.to(rendered_depth.device)
-                    valid_mask = torch.isfinite(propagated_depth) & (propagated_depth > 0) & (propagated_depth != 300)
-
-                    # calculate the abs rel depth error of the propagated depth and rendered depth & render color error
-                    abs_rel_error = torch.abs(propagated_depth - rendered_depth) / propagated_depth.clamp_min(1e-6)
-                    depth_error_max_threshold = 1.0
-                    depth_error_min_threshold = 0.8
-                    abs_rel_error_threshold = depth_error_max_threshold - (depth_error_max_threshold - depth_error_min_threshold) * (iteration - optim_args.propagated_iteration_begin) / (optim_args.propagated_iteration_end - optim_args.propagated_iteration_begin)
-                    # color error
-
-                    # color_error = torch.abs(render_color - gt_image)
-                    # color_error = color_error.mean(dim=0).squeeze()
-                    #for waymo, quantile 0.6; for free dataset, quantile 0.4
-                    error_mask = (abs_rel_error > abs_rel_error_threshold)
-                    
-                    # Camera-to-object poses compensate motion in both reprojection directions.
-                    ref_K = viewpoint_cam.K
-                    ref_pose = (viewpoint_cam.world_view_transform.transpose(0, 1) @ ref_o2w).inverse()
-                    geometric_counts = None
-                    # for idx, src_idx in enumerate(src_idxs):
-                    for idx in range(len(src_idxs)):
-                        src_idx = src_idxs[idx]
-                        if src_idx not in obj_views:
-                            continue
-                        src_viewpoint = viewpoint_full_stack[src_idx]
-                        src_K = src_viewpoint.K
-                        src_o2w = get_actor_pose_world(gaussians.actor_pose, track_id, src_viewpoint)
-                        src_pose = (src_viewpoint.world_view_transform.transpose(0, 1) @ src_o2w).inverse()
-
-                        # src_render_pkg = gaussians_renderer.render(src_viewpoint, gaussians) #, render_type="hard_depth")
-                        src_render_pkg = gaussians_renderer.render_object(src_viewpoint, gaussians)
-                        src_rendered_depth = src_render_pkg['depth'][0] 
-                        src_rendered_normal = src_render_pkg['normals']
-
-                        #get the src_depth first
-                        # depth_propagation(src_viewpoint, torch.zeros_like(src_projected_depth).cuda(), viewpoint_stack, src_idxs, opt.dataset, opt.patch_size)
-                        src_idxs_for_src = src_idxs[:idx] + src_idxs[idx + 1:] + [randidx]
-                        # depth_propagation(src_idx, src_idxs_for_src, src_rendered_depth.detach().cpu().numpy(), src_rendered_normal.detach().cpu().numpy().transpose(1,2,0), viewpoint_full_stack, dataset, vehicle_name=vehicle_name, patch_size=20)
-                        src_depth, cost, src_normal = depth_propagation(src_idx, src_idxs_for_src, src_rendered_depth, src_rendered_normal, viewpoint_full_stack, dataset, vehicle_name=vehicle_name, patch_size=20, actor_pose=gaussians.actor_pose)
-                        if src_depth is None:
-                            print("no props")
-                            continue 
-
-                        # src_depth, cost, src_normal = read_propagted_depth('./cache/propagated_depth')
-                        # src_depth = torch.tensor(src_depth).cuda()
-                        mask, depth_reprojected, x2d_src, y2d_src, relative_depth_diff = check_geometric_consistency(propagated_depth.unsqueeze(0), ref_K.unsqueeze(0), 
-                                                                                                                        ref_pose.unsqueeze(0), src_depth.unsqueeze(0), 
-                                                                                                                        src_K.unsqueeze(0), src_pose.unsqueeze(0), thre1=2, thre2=0.01)
-                        if geometric_counts is None:
-                            geometric_counts = mask.to(torch.uint8)
-                        else:
-                            geometric_counts += mask.to(torch.uint8)
-                            
-                    if geometric_counts is None:
-                        continue
-                    cost = geometric_counts.squeeze() # 这里cost大约代表各视角下共享视野的部分，越高代表被共同观测且匹配成功的视角越多
-                    # cost_mask = cost >= 2
-                    cost_mask = cost >= len(src_idxs)*0.5 #0.75
-                    
-                    #set -10 as nan              
-                    # normal[~(cost_mask.unsqueeze(0).repeat(3, 1, 1))] = -10
-                    # if viewpoint_cam.guidance['mono_normal'] is None:
-                    #     viewpoint_cam.guidance['mono_normal'] = normal.cpu()
-                    # else:
-                    update_mask = (cost_mask & obj_mask).unsqueeze(0).repeat(3, 1, 1)
-                    # update_mask = obj_mask & normal[:,:,0] != -10
-                    mono_normal[update_mask] = propagated_normal[update_mask]
-                    # viewpoint_cam.guidance['mono_normal'] = mono_normal #.cpu()
-                    
-                    propagated_mask = valid_mask & ~error_mask & cost_mask # propagation有值 & 由渲染获得的D误差足够大 & 被多个视角共同观测 
-                    if sky_mask is not None:
-                        propagated_mask = propagated_mask & ~sky_mask[0]
-
-                    # if obj_bound is not None:
-                    #     propagated_mask = propagated_mask & ~obj_bound[0]
-
-                    if obj_mask is not None:
-                        propagated_mask = propagated_mask & obj_mask
-
-                    if propagated_mask.sum() > 100:
-                        K = viewpoint_cam.K
-                        cam2target = viewpoint_cam.world_view_transform.transpose(0, 1).inverse()
-                        
-                        actor_count = obj_model.get_xyz.shape[0]
-                        if actor_count < 1000:
-                            target_count = min(propagated_mask.sum() // 2, 800)
-                        if actor_count < 2000:
-                            target_count = min(propagated_mask.sum() // 4, 500)
-                        elif actor_count < 4000:
-                            target_count = min(propagated_mask.sum() // 8, 200)
-                        else:
-                            target_count = min(propagated_mask.sum() // 16, 100)
-
-                        if target_count < 10:
-                            continue
-                        obj_model.densify_from_depth_propagation(K, cam2target, propagated_depth, propagated_normal, propagated_mask.to(torch.bool), render_acc, gt_image, obj_rots, obj_trans, init_opacity=0.3, target_count=target_count) 
-                    
             # torch.cuda.empty_cache()
             
 
