@@ -21,7 +21,7 @@ import numpy as np
 import cv2
 from lib.models.trellis import parallel_rasterize
 from lib.models.street_gaussian_model import quaternion_raw_multiply, matrix_to_quaternion, quaternion_to_matrix
-from lib.models.mvs import densify_bkgd_by_viewpoint
+from lib.models.mvs import densify_bkgd_by_viewpoint, vggt_region_has_missing_depth, get_actor_pose_world
 ############################
 import time
 import matplotlib.pyplot as plt
@@ -198,9 +198,9 @@ def training():
         if not viewpoint_stack:
             viewpoint_stack = scene.getTrainCameras().copy()
             view_stack_iter += 1
-        
-        # viewpoint_cam = viewpoint_full_stack[18]
-        viewpoint_cam: Camera = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
+        # only for debug. 后续关闭
+        viewpoint_cam = viewpoint_full_stack[143]
+        # viewpoint_cam: Camera = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
         randidx = viewpoint_cam.id
         
         gt_image = viewpoint_cam.original_image
@@ -278,7 +278,7 @@ def training():
 
                 gaussians.set_visibility(include_list)
                 gaussians.parse_camera(viewpoint_cam)
-                obj_render_pkg = gaussians_renderer.render_object(viewpoint_cam, gaussians, parse_camera_again=True)
+                obj_render_pkg = gaussians_renderer.render_object(viewpoint_cam, gaussians) #, parse_camera_again=True)
                 obj_acc = obj_render_pkg["acc"]
 
                 actor_mask = torch.any(dynamic_mask != 255, axis=0, keepdim=True)
@@ -321,8 +321,8 @@ def training():
                     post += cams_per_frame
                 if post < FULL_STACK_LENGTH:
                     src_idxs.append(post)        
-
-                # render_pkg = gaussians_renderer.render(viewpoint_cam, gaussians) #, render_type="hard_depth")
+                # only for debug. 后续关闭
+                soft_render_pkg = gaussians_renderer.render(viewpoint_cam, gaussians) #, render_type="hard_depth")
                 
                 # rendered_depth = render_pkg['depth'][0]
                 # rendered_normal = render_pkg['normals']
@@ -431,8 +431,8 @@ def training():
                         target_count = propagated_mask.sum() // 4 # min(propagated_mask.sum() // 16, 400)
                     else:
                         target_count = propagated_mask.sum() // 16 # min(propagated_mask.sum() // 64, 200)
-
-
+                    # only for debug. 后续关闭
+                    acc = soft_render_pkg['acc']
                     gaussians.background.densify_from_depth_propagation(K, cam2target, propagated_depth, propagated_normal, propagated_mask.to(torch.bool), acc, gt_image, init_opacity=0.1, target_count=target_count) 
                 
 
@@ -445,22 +445,42 @@ def training():
                 segment_img = seg_bkgd_mask.cpu().detach().numpy().transpose(1,2,0)
                 no_bkgd_mask = np.logical_or(sky_mask.cpu().detach().numpy()[0], torch.any(dynamic_mask != 255, axis=0).cpu().detach().numpy())
 
-                vacancy_exist, vacancy_colors = gaussians.background.grape_trellis.if_vacancy_in_ref_view_masks(voxel_depth_value, segment_img, no_bkgd_mask, vacancy_threshold=0.5)
+                if USE_TRELLIS:
+                    vacancy_exist, vacancy_colors = gaussians.background.grape_trellis.if_vacancy_in_ref_view_masks(voxel_depth_value, segment_img, no_bkgd_mask, vacancy_threshold=0.5)
+                else:
+                    vacancy_colors = []
+                    voxel_info = dataset.scene_info.metadata.get('vggt_voxel_info')
+                    if voxel_info is not None and 'vggt_voxel_id' in viewpoint_cam.guidance:
+                        soft_render_pkg = gaussians_renderer.render(viewpoint_cam, gaussians)
+                        # ref_depth = soft_render_pkg['depth'][0] / soft_render_pkg['acc'][0].clamp_min(1e-6)
+                        ref_depth = soft_render_pkg['depth'][0]
+                        source_depth_cache = {}
+                        for c in np.unique(segment_img.reshape(-1, 3), axis=0):
+                            if np.all(c == 0) or np.all(c == 1):
+                                continue
+                            obj_mask = np.all(segment_img == c, axis=2) & ~no_bkgd_mask
+                            if obj_mask.sum() < 100 * 100:
+                                continue
+                            if vggt_region_has_missing_depth(
+                                    obj_mask, viewpoint_cam, ref_depth, voxel_info,
+                                    viewpoint_full_stack, gaussians, gaussians_renderer,
+                                    source_depth_cache, train_view_ids):
+                                vacancy_colors.append(c)
+                    vacancy_exist = bool(vacancy_colors)
                 if vacancy_exist:
-
-                    # soft_render_pkg = gaussians_renderer.render(viewpoint_cam, gaussians) #, render_type="hard_depth")
+                    # only for debug. 后续关闭
+                    soft_render_pkg = gaussians_renderer.render(viewpoint_cam, gaussians) #, render_type="hard_depth")
 
                     rendered_depth = soft_render_pkg['depth'][0]
                     rendered_normal = soft_render_pkg['normals']
 
                     for c in vacancy_colors:
                         obj_mask = np.all(segment_img == c, axis=2) & ~no_bkgd_mask
-                        selected_vals = obj_mask[uvs[mask_visible, 1], uvs[mask_visible, 0]]
-                        mask_visible_obj = mask_visible.copy()
-                        mask_visible_obj[mask_visible] &= selected_vals
-                        # use_trellis = mask_visible_obj.sum() >= 10
                         use_trellis = USE_TRELLIS
                         if use_trellis:
+                            selected_vals = obj_mask[uvs[mask_visible, 1], uvs[mask_visible, 0]]
+                            mask_visible_obj = mask_visible.copy()
+                            mask_visible_obj[mask_visible] &= selected_vals
                             if mask_visible_obj.sum() < 10:
                                 continue
                             ref_src_views, viewset_diversity_score, _ = gaussians.background.grape_trellis.sample_viewset_from_obj_mask(
@@ -588,7 +608,8 @@ def training():
                                 target_count = propagated_mask.sum() // 4
                             else:
                                 target_count = propagated_mask.sum() // 16
-
+                            # only for debug. 后续关闭
+                            acc = soft_render_pkg['acc']
                             gaussians.background.densify_from_depth_propagation(K, cam2target, propagated_depth, propagated_normal, propagated_mask.to(torch.bool), acc, gt_image, init_opacity=0.3, target_count=target_count) 
 
 
@@ -610,9 +631,9 @@ def training():
 
                     # render_pkg_obj = gaussians_renderer.render(viewpoint_cam, gaussians, exclude_list=["background"], render_type="hard_depth")
 
-                    gaussians.set_visibility(include_list)
+                    gaussians.set_visibility(gaussians.obj_list)
                     gaussians.parse_camera(viewpoint_cam)
-                    # obj_render_pkg = gaussians_renderer.render_object(viewpoint_cam, gaussians, parse_camera_again=True)
+                    obj_render_pkg = gaussians_renderer.render_object(viewpoint_cam, gaussians)
 
                     render_color = obj_render_pkg['rgb']
                     rendered_depth = obj_render_pkg['depth'][0]
@@ -633,13 +654,13 @@ def training():
 
 
                     track_id = obj_model.track_id
-                    obj_rot = gaussians.actor_pose.get_tracking_rotation(track_id, viewpoint_cam)
-                    obj_trans = gaussians.actor_pose.get_tracking_translation(track_id, viewpoint_cam)                
-                    ego_pose = viewpoint_cam.ego_pose
-                    ego_pose_rot = matrix_to_quaternion(ego_pose[:3, :3].unsqueeze(0)).squeeze(0)
-                    obj_rot = quaternion_raw_multiply(ego_pose_rot.unsqueeze(0), obj_rot.unsqueeze(0)).squeeze(0)
-                    obj_rots = quaternion_to_matrix(obj_rot)
-                    obj_trans = ego_pose[:3, :3] @ obj_trans + ego_pose[:3, 3]
+                    obj_views = dataset.scene_info.metadata["obj_view_dict"][track_id]
+                    if randidx not in obj_views:
+                        continue
+                    # Keep the reference ActorPose for projection, consistency and insertion.
+                    ref_o2w = get_actor_pose_world(gaussians.actor_pose, track_id, viewpoint_cam)
+                    obj_rots = ref_o2w[:3, :3].unsqueeze(0)
+                    obj_trans = ref_o2w[:3, 3]
 
                     voxel_depth_value, voxel_depth_source, mask_visible, uvs = obj_model.grape_trellis.render_voxel_depth(current_view, img_H, img_W, K=viewpoint_cam.K, obj_rots=obj_rots, obj_trans=obj_trans)
                     if mask_visible.sum() < 10:
@@ -657,7 +678,7 @@ def training():
                     src_idxs = ref_src_views[1:]
                     # get the propagated depth
                     # depth_propagation(randidx, src_idxs, rendered_depth.detach().cpu().numpy(), rendered_normal.detach().cpu().numpy().transpose(1,2,0), viewpoint_full_stack, dataset, vehicle_name=vehicle_name, patch_size=20)
-                    propagated_depth, cost, propagated_normal = depth_propagation(randidx, src_idxs, rendered_depth, rendered_normal, viewpoint_full_stack, dataset, vehicle_name=vehicle_name, patch_size=20)
+                    propagated_depth, cost, propagated_normal = depth_propagation(randidx, src_idxs, rendered_depth, rendered_normal, viewpoint_full_stack, dataset, vehicle_name=vehicle_name, patch_size=20, actor_pose=gaussians.actor_pose)
                     if propagated_depth is None:
                         print("no props")
                         continue 
@@ -686,23 +707,22 @@ def training():
                     #for waymo, quantile 0.6; for free dataset, quantile 0.4
                     error_mask = (abs_rel_error > abs_rel_error_threshold)
                     
-                    # calculate the geometric consistency
+                    # Camera-to-object poses compensate motion in both reprojection directions.
                     ref_K = viewpoint_cam.K
-                    ref_pose = viewpoint_cam.world_view_transform.transpose(0, 1).inverse()
+                    ref_pose = (viewpoint_cam.world_view_transform.transpose(0, 1) @ ref_o2w).inverse()
                     geometric_counts = None
                     # for idx, src_idx in enumerate(src_idxs):
                     for idx in range(len(src_idxs)):
                         src_idx = src_idxs[idx]
+                        if src_idx not in obj_views:
+                            continue
                         src_viewpoint = viewpoint_full_stack[src_idx]
-                        #c2w
-                        src_pose = src_viewpoint.world_view_transform.transpose(0, 1).inverse()
                         src_K = src_viewpoint.K
-
-                        gaussians.set_visibility(include_list)
-                        gaussians.parse_camera(src_viewpoint)
+                        src_o2w = get_actor_pose_world(gaussians.actor_pose, track_id, src_viewpoint)
+                        src_pose = (src_viewpoint.world_view_transform.transpose(0, 1) @ src_o2w).inverse()
 
                         # src_render_pkg = gaussians_renderer.render(src_viewpoint, gaussians) #, render_type="hard_depth")
-                        src_render_pkg = gaussians_renderer.render_object(src_viewpoint, gaussians, parse_camera_again=False)
+                        src_render_pkg = gaussians_renderer.render_object(src_viewpoint, gaussians)
                         src_rendered_depth = src_render_pkg['depth'][0] 
                         src_rendered_normal = src_render_pkg['normals']
 
@@ -710,7 +730,7 @@ def training():
                         # depth_propagation(src_viewpoint, torch.zeros_like(src_projected_depth).cuda(), viewpoint_stack, src_idxs, opt.dataset, opt.patch_size)
                         src_idxs_for_src = src_idxs[:idx] + src_idxs[idx + 1:] + [randidx]
                         # depth_propagation(src_idx, src_idxs_for_src, src_rendered_depth.detach().cpu().numpy(), src_rendered_normal.detach().cpu().numpy().transpose(1,2,0), viewpoint_full_stack, dataset, vehicle_name=vehicle_name, patch_size=20)
-                        src_depth, cost, src_normal = depth_propagation(src_idx, src_idxs_for_src, src_rendered_depth, src_rendered_normal, viewpoint_full_stack, dataset, vehicle_name=vehicle_name, patch_size=20)
+                        src_depth, cost, src_normal = depth_propagation(src_idx, src_idxs_for_src, src_rendered_depth, src_rendered_normal, viewpoint_full_stack, dataset, vehicle_name=vehicle_name, patch_size=20, actor_pose=gaussians.actor_pose)
                         if src_depth is None:
                             print("no props")
                             continue 

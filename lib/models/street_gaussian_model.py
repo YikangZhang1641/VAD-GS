@@ -258,7 +258,7 @@ class StreetGaussianModel(nn.Module):
                 obj_model: GaussianModelActor = getattr(self, obj_name)
                 track_id = obj_model.track_id
                 obj_rot = self.actor_pose.get_tracking_rotation(track_id, self.viewpoint_camera)
-                obj_trans = self.actor_pose.get_tracking_translation(track_id, self.viewpoint_camera)                
+                obj_trans = self.actor_pose.get_tracking_translation(track_id, self.viewpoint_camera)
                 ego_pose = self.viewpoint_camera.ego_pose
                 ego_pose_rot = matrix_to_quaternion(ego_pose[:3, :3].unsqueeze(0)).squeeze(0)
                 obj_rot = quaternion_raw_multiply(ego_pose_rot.unsqueeze(0), obj_rot.unsqueeze(0)).squeeze(0)
@@ -463,15 +463,17 @@ class StreetGaussianModel(nn.Module):
             normals_bkgd = self.background.get_normals(camera)            
             normals.append(normals_bkgd)
             
+        obj_offset = 0
         for i, obj_name in enumerate(self.graph_obj_list):
             obj_model: GaussianModelActor = getattr(self, obj_name)
-            track_id = obj_model.track_id
 
             normals_obj_local = obj_model.get_normals(camera) # [N, 3]
-                    
-            obj_rot = self.actor_pose.get_tracking_rotation(track_id, self.viewpoint_camera)
-            obj_rot = quaternion_to_matrix(obj_rot).squeeze(0)
-            obj_rot = self.viewpoint_camera.ego_pose[:3, :3] @ obj_rot # codex检查出的对齐错误。是否确定？
+            if len(normals_obj_local) == 0:
+                normals.append(normals_obj_local)
+                continue
+            # Use the same object-to-world rotation as the Gaussian geometry.
+            obj_rot = quaternion_to_matrix(self.obj_rots[obj_offset:obj_offset + 1]).squeeze(0)
+            obj_offset += len(normals_obj_local)
             
             normals_obj_global = normals_obj_local @ obj_rot.T
             normals_obj_global = torch.nn.functional.normalize(normals_obj_global)                

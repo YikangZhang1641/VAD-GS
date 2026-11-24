@@ -12,6 +12,8 @@ import subprocess
 from random import randint
 import patchmatch_cuda
 from lib.config import cfg
+from lib.datasets.vggt_prediction_io import get_vggt_pixel_source_views
+from lib.utils.general_utils import matrix_to_quaternion, quaternion_raw_multiply, quaternion_to_matrix
 
 def write_cam_txt(cam_path, K, w2c, depth_range):
     with open(cam_path, "w") as file:
@@ -222,6 +224,106 @@ def reproject_with_depth(depth_ref, intrinsics_ref, extrinsics_ref, depth_src, i
     return depth_reprojected, x_reprojected, y_reprojected, x_src, y_src
 
 
+@torch.no_grad()
+def vggt_region_has_missing_depth(obj_mask, ref_camera, ref_depth, voxel_info,
+                                  cameras, gaussians, renderer, source_depth_cache,
+                                  allowed_view_ids, max_samples=256,
+                                  depth_error_threshold=0.1, missing_ratio=0.5,
+                                  min_valid_samples=16):
+    """Vote for missing geometry only when ref depth is farther than source depth.
+
+    Source views come from each sampled pixel's VGGT co-visibility lookup.
+    ref_depth and cached source depths are camera-Z depths normalized by opacity.
+    The cache is shared across regions of one reference check, before insertion.
+    """
+    if voxel_info is None or 'vggt_voxel_id' not in ref_camera.guidance:
+        return False
+    y, x = np.nonzero(obj_mask)
+    if len(x) < min_valid_samples:
+        return False
+    if len(x) > max_samples:
+        indices = np.linspace(0, len(x) - 1, max_samples, dtype=np.int64)
+        y, x = y[indices], x[indices]
+    device, dtype = ref_depth.device, ref_depth.dtype
+    uv = torch.as_tensor(np.column_stack((x, y, np.ones_like(x))), device=device, dtype=dtype)
+    depths = ref_depth[y, x]
+    ref_valid = torch.isfinite(depths) & (depths > 0)
+    ref_valid_cpu = ref_valid.cpu().numpy()
+    xyz_ref = (torch.linalg.inv(ref_camera.K.to(ref_depth)) @ uv.T).T * depths[:, None]
+    ref_w2c = ref_camera.world_view_transform.T.to(ref_depth)
+    ref_c2w = torch.linalg.inv(ref_w2c)
+    allowed = set(allowed_view_ids)
+    samples_by_view = {}
+    for index, (u, v) in enumerate(zip(x, y)):
+        if not ref_valid_cpu[index]:
+            continue
+        for view_id in get_vggt_pixel_source_views(ref_camera, voxel_info, int(u), int(v)):
+            view_id = int(view_id)
+            if view_id != ref_camera.id and view_id in allowed and 0 <= view_id < len(cameras):
+                samples_by_view.setdefault(view_id, []).append(index)
+    if not samples_by_view:
+        return False
+
+    valid_votes = torch.zeros(len(x), dtype=torch.int32, device=device)
+    far_votes = torch.zeros_like(valid_votes)
+    previous_include = list(gaussians.include_list)
+    previous_camera = gaussians.viewpoint_camera
+    try:
+        for view_id, sample_ids in samples_by_view.items():
+            camera = cameras[view_id]
+            ids = torch.as_tensor(sample_ids, device=device, dtype=torch.long)
+            src_w2c = camera.world_view_transform.T.to(ref_depth)
+            ref2src = src_w2c @ ref_c2w
+            xyz_src = xyz_ref[ids] @ ref2src[:3, :3].T + ref2src[:3, 3]
+            projected = xyz_src @ camera.K.to(ref_depth).T
+            xy_src = projected[:, :2] / projected[:, 2:3]
+            height, width = camera.image_height, camera.image_width
+            inside = (torch.isfinite(xy_src).all(dim=1) & (xyz_src[:, 2] > 0)
+                      & (xy_src[:, 0] >= 0) & (xy_src[:, 0] <= width - 1)
+                      & (xy_src[:, 1] >= 0) & (xy_src[:, 1] <= height - 1))
+            ids, xy_src = ids[inside], xy_src[inside]
+            if not len(ids):
+                continue
+            if view_id not in source_depth_cache:
+                rendered = renderer.render(camera, gaussians)
+                acc = rendered['acc'][0]
+                depth = rendered['depth'][0] / acc.clamp_min(1e-6)
+                valid = torch.isfinite(depth) & (depth > 0) & (acc > 0.5)
+                sky = camera.guidance.get('sky_mask')
+                dynamic = camera.guidance.get('dynamic_mask')
+                if sky is not None:
+                    valid &= ~sky[0].to(device=device, dtype=torch.bool)
+                if dynamic is not None:
+                    valid &= torch.all(dynamic.to(device) == 255, dim=0)
+                source_depth_cache[view_id] = (depth, valid)
+            depth, valid = source_depth_cache[view_id]
+            grid = torch.stack((2 * xy_src[:, 0] / max(width - 1, 1) - 1,
+                                2 * xy_src[:, 1] / max(height - 1, 1) - 1), dim=-1)[None, None]
+            sampled_depth = torch.nn.functional.grid_sample(
+                depth[None, None], grid, mode='bilinear', align_corners=True).reshape(-1)
+            sampled_valid = torch.nn.functional.grid_sample(
+                valid[None, None].to(dtype), grid, mode='nearest', align_corners=True).reshape(-1) > 0.5
+            # Transform the sampled SOURCE surface back into the REF frame.
+            src_uv = torch.cat((xy_src, torch.ones_like(xy_src[:, :1])), dim=1)
+            src_surface = (torch.linalg.inv(camera.K.to(ref_depth)) @ src_uv.T).T * sampled_depth[:, None]
+            src2ref = ref_w2c @ torch.linalg.inv(src_w2c)
+            depth_in_ref = (src_surface @ src2ref[:3, :3].T + src2ref[:3, 3])[:, 2]
+            valid_pair = (sampled_valid & torch.isfinite(sampled_depth) & (sampled_depth > 0)
+                          & torch.isfinite(depth_in_ref) & (depth_in_ref > 0))
+            ids, depth_in_ref = ids[valid_pair], depth_in_ref[valid_pair]
+            valid_votes[ids] += 1
+            # Signed error: a closer ref surface must NOT count as missing.
+            far_votes[ids] += (depths[ids] > depth_in_ref * (1 + depth_error_threshold)).to(torch.int32)
+    finally:
+        gaussians.set_visibility(previous_include)
+        gaussians.parse_camera(previous_camera)
+
+    valid_samples = valid_votes >= 2
+    missing_samples = valid_samples & (far_votes >= 2) & (far_votes * 2 > valid_votes)
+    return (int(valid_samples.sum()) >= min_valid_samples
+            and int(missing_samples.sum()) > int(valid_samples.sum()) * missing_ratio)
+
+
 def check_geometric_consistency(depth_ref, intrinsics_ref, extrinsics_ref, depth_src, intrinsics_src, extrinsics_src, thre1=1, thre2=0.01):
     batch, height, width = depth_ref.shape
     y_ref, x_ref = torch.meshgrid(torch.arange(0, height).to(depth_ref.device), torch.arange(0, width).to(depth_ref.device))
@@ -356,10 +458,24 @@ def check_geometric_consistency(depth_ref, intrinsics_ref, extrinsics_ref, depth
 #     os.system(propagation_command)
 #     return ref_ext
 
-def depth_propagation(current_view, src_idxs, rendered_depth, rendered_normals, viewpoint_stack, dataset, vehicle_name=None, patch_size=20):
-    num_cams = dataset.scene_info.metadata["num_cams"]
-    frame_id = current_view // num_cams
+def get_actor_pose_world(actor_pose, track_id, camera):
+    """Object-to-world pose, using the same ActorPose and ego pose as rendering."""
+    # ActorPose returns [4] or [1, 4], depending on opt_track.
+    obj_rot = actor_pose.get_tracking_rotation(track_id, camera).reshape(1, 4)
+    obj_trans = actor_pose.get_tracking_translation(track_id, camera)
+    ego_pose = camera.ego_pose
+    ego_rot = matrix_to_quaternion(ego_pose[:3, :3].unsqueeze(0))
+    world_rot = quaternion_raw_multiply(ego_rot, obj_rot)
+    obj_pose_world = torch.eye(4, device=ego_pose.device, dtype=ego_pose.dtype)
+    obj_pose_world[:3, :3] = quaternion_to_matrix(world_rot)[0]
+    obj_pose_world[:3, 3] = ego_pose[:3, :3] @ obj_trans + ego_pose[:3, 3]
+    return obj_pose_world
+
+
+def depth_propagation(current_view, src_idxs, rendered_depth, rendered_normals, viewpoint_stack, dataset, vehicle_name=None, patch_size=20, actor_pose=None):
     viewpoint_cam = viewpoint_stack[current_view]
+    if vehicle_name is not None and actor_pose is None:
+        raise ValueError('actor_pose is required for actor depth propagation')
 
     img_H, img_W = rendered_depth.shape
     # channel = randint(0,2)
@@ -382,10 +498,9 @@ def depth_propagation(current_view, src_idxs, rendered_depth, rendered_normals, 
         if current_view not in obj_view_dict[vehicle_name]:
             print("obj not exist in ref", current_view)
             return None, None, None
-        obj_pose_vehicle = obj_view_dict[vehicle_name][current_view][1]
-        ego_pose = dataset.scene_info.metadata["ego_frame_poses"][frame_id]
-        
-        ref_o2c = ref_w2c @ ego_pose @ obj_pose_vehicle
+        # Dict membership only filters visibility; poses follow the renderer.
+        ref_o2w = get_actor_pose_world(actor_pose, vehicle_name, viewpoint_cam).detach().cpu()
+        ref_o2c = ref_w2c @ ref_o2w
         ref_ext = ref_o2c
     mask_tensors = [255*all_mask.byte().contiguous().cuda()]
 
@@ -405,7 +520,6 @@ def depth_propagation(current_view, src_idxs, rendered_depth, rendered_normals, 
     camera_tensors = [row.float().unsqueeze(0).contiguous().cuda()]
 
     for idx, src_idx in enumerate(src_idxs):
-        frame_id = src_idx // num_cams
         src_viewpoint = viewpoint_stack[src_idx]
 
         src_w2c = src_viewpoint.world_view_transform.transpose(0, 1).detach().cpu()
@@ -423,10 +537,8 @@ def depth_propagation(current_view, src_idxs, rendered_depth, rendered_normals, 
             if src_idx not in obj_view_dict[vehicle_name]:
                 print("obj not exist in src", src_idx)
                 continue
-            obj_pose_vehicle = obj_view_dict[vehicle_name][src_idx][1]
-
-            ego_pose = dataset.scene_info.metadata["ego_frame_poses"][frame_id]
-            src_o2c = src_w2c @ ego_pose @ obj_pose_vehicle
+            src_o2w = get_actor_pose_world(actor_pose, vehicle_name, src_viewpoint).detach().cpu()
+            src_o2c = src_w2c @ src_o2w
             src_ext = src_o2c
 
         mask_tensors.append(255*all_mask.byte().contiguous().cuda())
