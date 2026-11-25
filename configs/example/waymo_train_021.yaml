@@ -3,8 +3,8 @@ source_path: data/waymo/training/021
 exp_name: waymo_train_021_3cam
 
 data:
-  split_test: -1
-  split_train: 1
+  split_test: 4
+  split_train: -1
   type: Waymo
   # type: DriveStudio
   white_background: false

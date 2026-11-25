@@ -104,7 +104,6 @@ def monitor_resources(
     nvmlShutdown()
 
 
-
 def training():
     training_args = cfg.train
     optim_args = cfg.optim
@@ -171,7 +170,6 @@ def training():
         viewpoint_full_stack.append(l2[j])
         j = j + 1
 
-
     FULL_STACK_LENGTH = len(viewpoint_full_stack)
     DIVERSITY_THRES = 1e-5
     view_stack_iter = start_iter // len(scene.getTrainCameras())
@@ -185,10 +183,8 @@ def training():
     N_bkgd_init = gaussians.background.get_xyz.shape[0]
 
     viewpoint_stack = None
-    check_interval = 0
-    check_history = 0
     for iteration in range(start_iter, training_args.iterations + 1):
-    
+
         iter_start.record()
         gaussians.update_learning_rate(iteration)
 
@@ -204,7 +200,7 @@ def training():
         # viewpoint_cam = viewpoint_full_stack[143]
         viewpoint_cam: Camera = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
         randidx = viewpoint_cam.id
-        
+
         gt_image = viewpoint_cam.original_image
         gt_image = gt_image.cuda(non_blocking=True) if not gt_image.is_cuda else gt_image
         loss_mask = viewpoint_cam.guidance['mask'] if 'mask' in viewpoint_cam.guidance else torch.ones_like(gt_image[0:1]).bool()
@@ -237,19 +233,83 @@ def training():
         if "bkgd_voxel" not in viewpoint_cam.guidance: # zyk: fixed here, not growing for now.
             voxel_depth_value, voxel_depth_source, mask_visible, uvs = gaussians.background.grape_trellis.render_voxel_depth(current_view, img_H, img_W, K=viewpoint_cam.K)
             viewpoint_cam.guidance["bkgd_voxel"] = (voxel_depth_value.astype(np.float16), voxel_depth_source.astype(np.int32), mask_visible, uvs.astype(np.int16))
-        
 
-        flag_global_reconstruct = False 
+        # flag_global_reconstruct = False
         flag_local_reconstruct = False
         flag_actor_reconstruct = False
 
         ###################### hard depth #######################
-        # check_views = [5, 10, 20, 40, 60, 80, 100]
-        # if view_stack_iter in check_views : # and iteration % optim_args.propagation_interval == 0:
         if view_stack_iter % optim_args.propagation_interval == 0 and iteration > optim_args.propagated_iteration_begin and iteration < optim_args.propagated_iteration_end:
             soft_render_pkg = gaussians_renderer.render(viewpoint_cam, gaussians)
             image = soft_render_pkg["rgb"]
+            acc = soft_render_pkg['acc']
+
             _similarity = ssim(image, gt_image, mask=loss_mask)
+
+            ######################################################## BACKGROUND CONTINUOUS ###############################################################################
+            # 1. 整体过差时走现有 global 调用；本分支不进行局部采样。
+            if _similarity < 0.6:
+                reconstruct_global(
+                    viewpoint_cam, viewpoint_full_stack, dataset, gaussians, gaussians_renderer, cams_per_frame, iteration, optim_args, gt_image, sky_mask, dynamic_mask, mono_normal, soft_render_pkg
+                )
+
+            else:
+                # 2. 用共用随机 offset 生成采样网格，再读取其 segment / 动态 ID。
+                # 每次检查重新抽样，仅限制总点数，不遍历整图 segment。
+                grid_size, max_samples = 32, 512
+                with torch.no_grad():
+                    segment_img = seg_bkgd_mask.detach().cpu().numpy().transpose(1, 2, 0)
+                    dynamic_img = dynamic_mask.detach().cpu().numpy()
+                    background_pixels = np.all(dynamic_img == 255, axis=0) & ~sky_mask[0].cpu().numpy() 
+                    # & ~np.all(segment_img == 0, axis=2) 
+                    # 动态区域不依赖背景 segment；背景跳过无效的分割颜色。
+                    sample_mask = valid_pixels & (~background_pixels | valid_segments)
+                    grid_origin_x, grid_origin_y = np.meshgrid(
+                        np.arange(0, img_W, grid_size), np.arange(0, img_H, grid_size))
+                    dx, dy = np.random.randint(0, grid_size, size=2)
+                    sample_x = (grid_origin_x + dx).ravel()
+                    sample_y = (grid_origin_y + dy).ravel()
+                    # 边缘越界点及落在无效区域的点直接丢弃，不补采样。
+                    inside = (sample_x < img_W) & (sample_y < img_H)
+                    sample_x, sample_y = sample_x[inside], sample_y[inside]
+                    valid = background_pixels[sample_y, sample_x]
+                    sample_x, sample_y = sample_x[valid], sample_y[valid]
+                    if len(sample_x) > max_samples:
+                        selected_id = np.random.choice(len(sample_x), max_samples, replace=False)
+                        sample_x, sample_y = sample_x[selected_id], sample_y[selected_id]
+
+
+                    # 3. 与采样坐标一一对应：-1 未知，0 未缺失，1 缺失。
+                    # 当前只有背景 voxel；actor 点保留未知，避免用静态重投影判断运动物体。
+                    sample_vacancy_state = torch.full((len(sample_x),), -1, dtype=torch.int8, device=image.device)
+                    if len(sample_x):
+                        sample_render_pkg = gaussians_renderer.render(viewpoint_cam, gaussians, render_type="hard_depth")
+                        sample_depth_map = sample_render_pkg.get('depth', torch.zeros_like(sample_render_pkg['acc']))[0]
+                        sample_depth = sample_depth_map[sample_y, sample_x]
+
+                        sample_voxel_depth = torch.as_tensor(
+                            viewpoint_cam.guidance['bkgd_voxel'][0][sample_y, sample_x],
+                            device=image.device, dtype=sample_depth.dtype)
+                        
+                        sample_voxel_comparable = sample_voxel_depth > 0 # & sample_render_valid
+                        sample_vacancy_state[sample_voxel_comparable] = (
+                            sample_depth[sample_voxel_comparable] > sample_voxel_depth[sample_voxel_comparable] * 1.1
+                        ).to(torch.int8)
+
+                        # # Debug Visualization
+                        # fig, ax = plt.subplots(figsize=(14, 8))
+                        # ax.imshow(gt_image.detach().cpu().permute(1, 2, 0).clamp(0, 1).numpy())
+                        # for state, label, color, marker in [(-1, "Unknown", "yellow", "x"), (0, "Not missing", "lime", "+"), (1, "Missing", "red", "o")]:
+                        #     selected = sample_vacancy_state.detach().cpu().numpy() == state
+                        #     style = {"facecolors": "none", "edgecolors": color} if marker == "o" else {"color": color}
+                        #     ax.scatter(sample_x[selected], sample_y[selected], marker=marker, s=45, linewidths=1.3, label=f"{label}: {selected.sum()}", **style)
+                        # ax.set_title(f"View {viewpoint_cam.id} | Iteration {iteration}")
+                        # ax.legend()
+                        # ax.set_axis_off()
+                        # plt.tight_layout()
+                        # plt.show()
+
+
             if _similarity < 0.8:
 
                 hard_render_pkg = gaussians_renderer.render(viewpoint_cam, gaussians, render_type="hard_depth")
@@ -264,10 +324,6 @@ def training():
                 if m1.sum() > (voxel_depth_tensor > 0).sum() * 0.2:
                     flag_local_reconstruct = True
 
-
-
-                acc = soft_render_pkg['acc']
-
                 bkgd_mask = ~sky_mask & ~torch.any(dynamic_mask != 255, axis=0, keepdim=True)
                 k = int(len(acc[bkgd_mask]) * 0.25)
                 v = acc[bkgd_mask].kthvalue(k).values
@@ -278,8 +334,6 @@ def training():
                 if v.item() < 0.9:
                     flag_local_reconstruct = True
 
-                # gaussians.set_visibility(include_list)
-                # gaussians.parse_camera(viewpoint_cam)
                 obj_render_pkg = gaussians_renderer.render_object(viewpoint_cam, gaussians) #, parse_camera_again=True)
                 obj_acc = obj_render_pkg["acc"]
 
@@ -291,19 +345,18 @@ def training():
                     if v.item() < 0.7:
                         flag_actor_reconstruct = True
 
-
         with torch.no_grad():
 
-######################################################## BACKGROUND CONTINUOUS ###############################################################################
-            if flag_global_reconstruct:
-                mono_normal = viewpoint_cam.guidance['mono_normal'] = reconstruct_global(viewpoint_cam, viewpoint_full_stack, dataset, gaussians, gaussians_renderer,
-                       cams_per_frame, iteration, optim_args, gt_image, sky_mask, dynamic_mask, mono_normal, soft_render_pkg)
+            ######################################################## BACKGROUND CONTINUOUS ###############################################################################
+            # if flag_global_reconstruct:
+            #     reconstruct_global(viewpoint_cam, viewpoint_full_stack, dataset, gaussians, gaussians_renderer,
+            #         cams_per_frame, iteration, optim_args, gt_image, sky_mask, dynamic_mask, mono_normal, soft_render_pkg)
 
-##################################### BACKGROUND DISCIRETE ##########################################################
+            ##################################### BACKGROUND DISCIRETE ##########################################################
             if flag_local_reconstruct and not optim_args.skip_view_selection: #  or iteration > FULL_STACK_LENGTH * 5 and iteration < FULL_STACK_LENGTH * 20 and (iteration % optim_args.propagation_interval == 0):
 
                 voxel_depth_value, voxel_depth_source, mask_visible, uvs = viewpoint_cam.guidance["bkgd_voxel"]
-                
+
                 segment_img = seg_bkgd_mask.cpu().detach().numpy().transpose(1,2,0)
                 no_bkgd_mask = np.logical_or(sky_mask.cpu().detach().numpy()[0], torch.any(dynamic_mask != 255, axis=0).cpu().detach().numpy())
 
@@ -364,20 +417,12 @@ def training():
                         # fig.tight_layout()
                         # plt.show()
 
-                        ref_src_views = [current_view] + list(dict.fromkeys(
-                            int(v) for v in ref_src_views[1:] if v in train_view_ids and v != current_view))
-                        if (len(ref_src_views) < 4 or not np.isfinite(viewset_diversity_score)
-                                or viewset_diversity_score < DIVERSITY_THRES):
-                            continue
-
-                        mono_normal = viewpoint_cam.guidance['mono_normal'] = reconstruct_local(
-                            ref_src_views, viewpoint_cam, viewpoint_full_stack, dataset, gaussians,
+                        reconstruct_local(ref_src_views, viewpoint_cam, viewpoint_full_stack, dataset, gaussians,
                             gaussians_renderer, mono_normal, soft_render_pkg, reconstruction_mask=obj_mask,
                             iteration=iteration, optim_args=optim_args, gt_image=gt_image,
                             sky_mask=sky_mask, dynamic_mask=dynamic_mask)
 
-
-##################################################### OBJECT #######################################################################################
+            ##################################################### OBJECT #######################################################################################
             if flag_actor_reconstruct and not optim_args.skip_view_selection: # or iteration > FULL_STACK_LENGTH * 0 and iteration < FULL_STACK_LENGTH * 20 and (iteration % optim_args.propagation_interval == 0):
                 for dynamic_key in torch.unique(dynamic_mask):
                     if dynamic_key == 255:
@@ -387,11 +432,9 @@ def training():
                     obj_name = "obj_%.3d"%dynamic_id
                     if obj_name not in include_list:
                         continue
-                    
+
                     obj_render_pkg = gaussians_renderer.render_object(viewpoint_cam, gaussians)
 
-                    render_color = obj_render_pkg['rgb']
-                    rendered_depth = obj_render_pkg['depth'][0]
                     rendered_normal = obj_render_pkg['normals']
                     render_acc = obj_render_pkg['acc']
 
@@ -420,20 +463,15 @@ def training():
                     if mask_visible.sum() < 10:
                         continue
                     # 过低的 point_obs_ratio 可能没有输出。按逻辑而言需要在此处加入更新voxel部分
-                    # ref_src_views, viewset_diversity_score, rootvine_xyz = obj_model.grape_trellis.sample_viewset_from_obj_mask(current_view, dynamic_mask==dynamic_id, voxel_depth_value, voxel_depth_source, mask_visible, point_obs_ratio=0.8)
                     ref_src_views, viewset_diversity_score, rootvine_xyz = obj_model.grape_trellis.sample_viewset_from_obj_mask(current_view, mask_visible, point_obs_ratio=0.4, N=4, obj_rots=obj_rots, obj_trans=obj_trans)
 
                     if len(ref_src_views) <= 4 or viewset_diversity_score < DIVERSITY_THRES:
                         continue
 
                     # 视角已在上方选定，重建函数只负责传播、法线更新和加点。
-                    mono_normal = viewpoint_cam.guidance['mono_normal'] = reconstruct_actor(
-                        ref_src_views, dynamic_id, viewpoint_cam, viewpoint_full_stack, dataset, gaussians,
+                    reconstruct_actor(ref_src_views, dynamic_id, viewpoint_cam, viewpoint_full_stack, dataset, gaussians,
                         gaussians_renderer, iteration, optim_args, gt_image,
                         sky_mask, dynamic_mask, mono_normal, obj_render_pkg)
-
-            # torch.cuda.empty_cache()
-            
 
         voxel_depth_value, voxel_depth_source, mask_visible, uvs = viewpoint_cam.guidance["bkgd_voxel"]
         voxel_depth_tensor = torch.from_numpy(voxel_depth_value).cuda()
@@ -458,17 +496,15 @@ def training():
             if iteration < training_args.iterations:                
                 gaussians.update_optimizer()
 
-
         soft_render_pkg = gaussians_renderer.render(viewpoint_cam, gaussians)
         image, acc, viewspace_point_tensor, visibility_filter, radii = soft_render_pkg["rgb"], soft_render_pkg['acc'], soft_render_pkg["viewspace_points"], soft_render_pkg["visibility_filter"], soft_render_pkg["radii"]
 
         scalar_dict = dict()
-        
+
         # rgb loss
         Ll1 = l1_loss(image, gt_image, mask=loss_mask)
         scalar_dict['l1_loss'] = Ll1.item()
         loss = (1.0 - optim_args.lambda_dssim) * optim_args.lambda_l1 * Ll1 + optim_args.lambda_dssim * (1.0 - ssim(image, gt_image, mask=loss_mask))
-
 
         # sky loss
         if optim_args.lambda_sky > 0 and gaussians.include_sky and sky_mask is not None:
@@ -478,7 +514,7 @@ def training():
                 sky_loss *= optim_args.lambda_sky_scale[viewpoint_cam.meta['cam']]
             scalar_dict['sky_loss'] = sky_loss.item()
             loss += optim_args.lambda_sky * sky_loss
-        
+
         if optim_args.lambda_reg > 0 and gaussians.include_obj and iteration >= optim_args.densify_until_iter:
             render_pkg_obj = gaussians_renderer.render_object(viewpoint_cam, gaussians, parse_camera_again=False)
             image_obj, acc_obj = render_pkg_obj["rgb"], render_pkg_obj['acc']
@@ -488,8 +524,6 @@ def training():
                 -torch.log(1. - acc_obj)).mean()
             scalar_dict['obj_acc_loss'] = obj_acc_loss.item()
             loss += optim_args.lambda_reg * obj_acc_loss
-
-
 
         # lidar depth loss
         if optim_args.lambda_depth_lidar > 0: 
@@ -511,7 +545,6 @@ def training():
                 scalar_dict['lidar_depth_loss'] = voxel_depth_loss
                 loss += optim_args.lambda_depth_lidar * voxel_depth_loss
 
-
         # color correction loss
         if optim_args.lambda_color_correction > 0 and gaussians.use_color_correction:
             color_correction_reg_loss = gaussians.color_correction.regularization_loss(viewpoint_cam)
@@ -525,7 +558,7 @@ def training():
                 if sky_mask is not None: # if viewpoint_cam.sky_mask is not None:
                     filter_mask = sky_mask.to(normal_gt.device).to(torch.bool)
                     normal_gt[(filter_mask.repeat(3, 1, 1))] = -10
-                    
+
                 filter_mask = (normal_gt != -10)[0, :, :].to(torch.bool)
                 l1_normal = torch.abs(rendered_normal - normal_gt).sum(dim=0)[filter_mask].mean()
                 cos_normal = (1. - torch.sum(rendered_normal * normal_gt, dim = 0))[filter_mask].mean()
@@ -537,11 +570,11 @@ def training():
                 viewpoint_cam.guidance['mono_normal'] = mono_normal #.cpu()
 
         scalar_dict['loss'] = loss.item()
-        
+
         loss.backward()
-        
+
         iter_end.record()
-                
+
         is_save_images = True
         if is_save_images and (iteration % 100 == 0):
             # row0: gt_image, image, depth
@@ -562,9 +595,9 @@ def training():
             image_to_show = torch.clamp(image_to_show, 0.0, 1.0)
             os.makedirs(f"{cfg.model_path}/log_images", exist_ok = True)
             save_img_torch(image_to_show, f"{cfg.model_path}/log_images/{iteration}.jpg")
-        
+
         with torch.no_grad():
-            
+
             # Log
             tensor_dict = dict()
 
@@ -577,7 +610,7 @@ def training():
                 ema_psnr_for_log = 0.4 * psnr(image, gt_image, loss_mask).mean().float().item() + 0.6 * ema_psnr_for_log
                 if np.isnan(ema_psnr_for_log):
                     ema_psnr_for_log = psnr(image, gt_image, loss_mask).mean().float().item()
-                
+
                 progress_bar.set_postfix({"Exp": f"{cfg.task}-{cfg.exp_name}", 
                                           "Loss": f"{ema_loss_for_log:.{7}f},", 
                                           "PSNR": f"{ema_psnr_for_log:.{4}f}",
@@ -598,7 +631,7 @@ def training():
                 gaussians.set_visibility(include_list=list(set(gaussians.model_name_id.keys()) - set(['sky'])))
                 gaussians.set_max_radii2D(radii, visibility_filter)
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
-                
+
                 prune_big_points = iteration > optim_args.opacity_reset_interval
 
                 if iteration > optim_args.densify_from_iter:
@@ -611,7 +644,7 @@ def training():
 
                         scalar_dict.update(scalars)
                         tensor_dict.update(tensors)
-                        
+
             # Reset opacity
             if iteration < optim_args.densify_until_iter:
                 if iteration % optim_args.opacity_reset_interval == 0:
@@ -632,7 +665,7 @@ def training():
                 ckpt_path = os.path.join(cfg.trained_model_dir, f'iteration_{iteration}.pth')
                 torch.save(state_dict, ckpt_path)
 
-                ###################### 
+                ######################
                 # viewpoint_camera = viewpoint_full_stack[60]
                 # frame_id=randidx
 
@@ -641,17 +674,17 @@ def training():
 
                 xyz = gaussians.get_xyz.detach().cpu().numpy()    
                 normals = np.zeros_like(xyz)
-                
+
                 f = gaussians.get_features.detach().transpose(1, 2).contiguous() # [n, 3, sh_degree]
                 f_dc = f[..., :1].flatten(start_dim=1).cpu().numpy()
                 f_rest = f[..., 1:].flatten(start_dim=1).cpu().numpy()
                 opacities = gaussians.get_opacity.detach().cpu().numpy()
                 opacities = np.clip(opacities, a_min=1e-6, a_max=1.-1e-6)
                 opacities = inverse_opacity(opacities)
-                
+
                 scale = gaussians.get_scaling.detach().cpu().numpy()
                 scale = inverse_scale(scale)
-                
+
                 rotation = gaussians.get_rotation.detach().cpu().numpy()
 
                 l = ['x', 'y', 'z', 'nx', 'ny', 'nz']
@@ -670,7 +703,7 @@ def training():
                 elements = np.empty(xyz.shape[0], dtype=dtype_full)
                 attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1)
                 elements[:] = list(map(tuple, attributes))
-                
+
                 save_dir = os.path.join(cfg.model_path, 'viewer', f'iteration_{iteration}_{current_view:06d}')
                 pointcloud_dir = os.path.join(save_dir, 'point_cloud', f'iteration_{iteration}')
                 os.makedirs(save_dir, exist_ok=True)
@@ -678,12 +711,9 @@ def training():
                 shutil.copyfile(os.path.join(cfg.model_path, 'cameras.json'), os.path.join(save_dir, 'cameras.json'))
                 shutil.copyfile(os.path.join(cfg.model_path, 'cfg_args'), os.path.join(save_dir, 'cfg_args'))
                 shutil.copyfile(os.path.join(cfg.model_path, 'input.ply'), os.path.join(save_dir, 'input.ply'))
-                
+
                 elements = PlyElement.describe(elements, 'vertex')
                 PlyData([elements]).write(os.path.join(pointcloud_dir, 'point_cloud.ply'))
-                
-
-
 
 
 def prepare_output_and_logger():
