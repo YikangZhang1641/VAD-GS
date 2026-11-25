@@ -261,7 +261,7 @@ def training():
                     segment_img = seg_bkgd_mask.detach().cpu().numpy().transpose(1, 2, 0)
                     dynamic_img = dynamic_mask.detach().cpu().numpy()
                     background_pixels = np.all(dynamic_img == 255, axis=0) & ~sky_mask[0].cpu().numpy() 
-                    # & ~np.all(segment_img == 0, axis=2) 
+                    # & ~np.all(segment_img == 0, axis=2)
                     # 动态区域不依赖背景 segment；背景跳过无效的分割颜色。
                     grid_origin_x, grid_origin_y = np.meshgrid(
                         np.arange(0, img_W, grid_size), np.arange(0, img_H, grid_size))
@@ -277,7 +277,6 @@ def training():
                         selected_id = np.random.choice(len(sample_x), max_samples, replace=False)
                         sample_x, sample_y = sample_x[selected_id], sample_y[selected_id]
 
-
                     # 3. 与采样坐标一一对应：-1 未知，0 未缺失，1 缺失。
                     # 当前只有背景 voxel；actor 点保留未知，避免用静态重投影判断运动物体。
                     sample_vacancy_state = torch.full((len(sample_x),), -1, dtype=torch.int8, device=image.device)
@@ -289,7 +288,7 @@ def training():
                         sample_voxel_depth = torch.as_tensor(
                             viewpoint_cam.guidance['bkgd_voxel'][0][sample_y, sample_x],
                             device=image.device, dtype=sample_depth.dtype)
-                        
+
                         sample_voxel_comparable = sample_voxel_depth > 0 # & sample_render_valid
                         sample_vacancy_state[sample_voxel_comparable] = (
                             sample_depth[sample_voxel_comparable] > sample_voxel_depth[sample_voxel_comparable] * 1.1
@@ -309,91 +308,117 @@ def training():
                         # plt.show()
 
                         def check_prior_depth_reprojection(ref_uv, ref_depth, ref_K, ref_w2c,
-                                                           src_depth, src_valid, src_K, src_w2c,
-                                                           depth_error_threshold=0.1):
-                            """输入同设备/浮点类型的 uv[N,2]、Z 深度及相机参数, w2c 为世界到相机矩阵。
-                            返回逐点 (可比较 mask, ref 更远 mask); src_valid[H,W] 为源有效区。
-                            """
-                            comparable = torch.zeros(len(ref_depth), dtype=torch.bool, device=ref_depth.device)
-                            farther = torch.zeros_like(comparable)
-                            ref_valid = torch.isfinite(ref_uv).all(dim=1) & torch.isfinite(ref_depth) & (ref_depth > 0)
-                            ids = torch.nonzero(ref_valid, as_tuple=True)[0]
-                            if not len(ids):
-                                return comparable, farther
-                            uv_h = torch.cat((ref_uv[ids], torch.ones_like(ref_uv[ids, :1])), dim=1)
-                            xyz_ref = (torch.linalg.inv(ref_K) @ uv_h.T).T * ref_depth[ids, None]
+                                                           prior_src_uv, src_K, src_w2c,
+                                                           pixel_error_threshold=3.0):
+                            """比较深度投影位置与 prior 对应像素，返回 (可比较 mask, 像素误差过大 mask)。"""
+                            uv_h = torch.cat((ref_uv, torch.ones_like(ref_uv[:, :1])), dim=1)
+                            xyz_ref = (torch.linalg.inv(ref_K) @ uv_h.T).T * ref_depth[:, None]
                             ref_to_src = src_w2c @ torch.linalg.inv(ref_w2c)
                             xyz_src = xyz_ref @ ref_to_src[:3, :3].T + ref_to_src[:3, 3]
                             projected = xyz_src @ src_K.T
                             uv_src = projected[:, :2] / projected[:, 2:3]
-                            height, width = src_depth.shape
-                            inside = (torch.isfinite(uv_src).all(dim=1) & (xyz_src[:, 2] > 0)
-                                      & (uv_src[:, 0] >= 0) & (uv_src[:, 0] <= width - 1)
-                                      & (uv_src[:, 1] >= 0) & (uv_src[:, 1] <= height - 1))
-                            ids, uv_src = ids[inside], uv_src[inside]
-                            if not len(ids):
-                                return comparable, farther
-                            src_valid = src_valid & torch.isfinite(src_depth) & (src_depth > 0)
-                            grid = torch.stack((2 * uv_src[:, 0] / max(width - 1, 1) - 1,
-                                                2 * uv_src[:, 1] / max(height - 1, 1) - 1), dim=-1)[None, None]
-                            # 插值邻域全部有效才比较，避免零值/NaN 污染深度。
-                            sampled_depth = torch.nn.functional.grid_sample(
-                                torch.where(src_valid, src_depth, torch.zeros_like(src_depth))[None, None],
-                                grid, mode='bilinear', align_corners=True).reshape(-1)
-                            sampled_valid = torch.nn.functional.grid_sample(
-                                src_valid[None, None].to(ref_depth.dtype), grid,
-                                mode='bilinear', align_corners=True).reshape(-1) > 0.999
-                            uv_src_h = torch.cat((uv_src, torch.ones_like(uv_src[:, :1])), dim=1)
-                            src_surface = (torch.linalg.inv(src_K) @ uv_src_h.T).T * sampled_depth[:, None]
-                            src_to_ref = torch.linalg.inv(ref_to_src)
-                            depth_in_ref = (src_surface @ src_to_ref[:3, :3].T + src_to_ref[:3, 3])[:, 2]
-                            valid_pair = sampled_valid & torch.isfinite(depth_in_ref) & (depth_in_ref > 0)
-                            comparable[ids] = valid_pair
-                            farther[ids] = valid_pair & (ref_depth[ids] > depth_in_ref * (1 + depth_error_threshold))
-                            return comparable, farther
+                            comparable = (
+                                torch.isfinite(ref_uv).all(dim=1)
+                                & torch.isfinite(ref_depth)
+                                & (ref_depth > 0)
+                                & torch.isfinite(prior_src_uv).all(dim=1)
+                                & (prior_src_uv >= 0).all(dim=1)
+                                & torch.isfinite(uv_src).all(dim=1)
+                                & (xyz_src[:, 2] > 0)
+                            )
+                            pixel_error = torch.linalg.norm(uv_src - prior_src_uv, dim=1)
+                            return comparable, comparable & (pixel_error > pixel_error_threshold)
 
                         # 只对没有 voxel 的采样点查询 prior；几何函数拒绝无效 ref 深度。
                         sample_prior_candidates = (~sample_voxel_comparable).cpu().numpy()
                         sample_voxel_info = dataset.scene_info.metadata.get('vggt_voxel_info')
                         sample_allowed_views = set(train_view_ids)
                         sample_ids_by_view = {}
+                        debug_coview_counts = np.zeros(len(sample_x), dtype=np.int32)
                         for sample_id in np.flatnonzero(sample_prior_candidates):
-                            for source_id in get_vggt_pixel_source_views(
-                                    viewpoint_cam, sample_voxel_info, int(sample_x[sample_id]), int(sample_y[sample_id])):
+                            source_views = get_vggt_pixel_source_views(
+                                viewpoint_cam, sample_voxel_info, int(sample_x[sample_id]), int(sample_y[sample_id]))
+                            # 调试数量：排除 ref，保留 train/test，区分 prior 本就无共视与后续过滤失败。
+                            debug_coview_counts[sample_id] = np.count_nonzero(source_views != viewpoint_cam.id)
+                            for source_id in source_views:
                                 source_id = int(source_id)
                                 if source_id != viewpoint_cam.id and source_id in sample_allowed_views:
                                     sample_ids_by_view.setdefault(source_id, []).append(sample_id)
 
                         sample_prior_valid_votes = torch.zeros(len(sample_x), dtype=torch.int32, device=sample_depth.device)
-                        sample_prior_far_votes = torch.zeros_like(sample_prior_valid_votes)
+                        sample_prior_error_votes = torch.zeros_like(sample_prior_valid_votes)
                         if sample_ids_by_view:
                             sample_uv = torch.as_tensor(np.column_stack((sample_x, sample_y)), device=sample_depth.device, dtype=sample_depth.dtype)
-                            # prior 查表、渲染及投票留在调用处，同一源帧只渲染一次。
+                            sample_prior_voxel_ids = viewpoint_cam.guidance['vggt_voxel_id'][sample_y, sample_x].cpu().numpy()
+                            # 每个源帧只扫描一次 ID 图，以同 ID 像素的中位位置作为 prior 对应点。
                             for source_id, sample_ids in sample_ids_by_view.items():
                                 source_camera = viewpoint_full_stack[source_id]
                                 source_ids = torch.as_tensor(sample_ids, device=sample_depth.device, dtype=torch.long)
-                                source_render_pkg = gaussians_renderer.render(source_camera, gaussians) #, render_type="hard_depth")
-                                source_depth = source_render_pkg['depth'][0]
-                                source_valid = ((source_render_pkg['acc'][0] > 0.5)
-                                                & ~source_camera.guidance['sky_mask'][0].to(sample_depth.device)
-                                                & torch.all(source_camera.guidance['dynamic_mask'].to(sample_depth.device) == 255, dim=0))
-                                source_pair_valid, source_farther = check_prior_depth_reprojection(
+                                source_voxel_ids = source_camera.guidance['vggt_voxel_id'].cpu().numpy()
+                                source_static = (~source_camera.guidance['sky_mask'][0].cpu().numpy()
+                                                 & torch.all(source_camera.guidance['dynamic_mask'] == 255, dim=0).cpu().numpy())
+                                source_y, source_x = np.nonzero(
+                                    np.isin(source_voxel_ids, sample_prior_voxel_ids[sample_ids]) & source_static)
+                                if not len(source_x):
+                                    continue
+                                observed_ids = source_voxel_ids[source_y, source_x]
+                                order = np.argsort(observed_ids)
+                                voxel_ids, starts, counts = np.unique(observed_ids[order], return_index=True, return_counts=True)
+                                source_uv_by_voxel = {
+                                    int(voxel_id): (np.median(source_x[order[start:start + count]]),
+                                                    np.median(source_y[order[start:start + count]]))
+                                    for voxel_id, start, count in zip(voxel_ids, starts, counts)
+                                }
+                                prior_source_uv = torch.as_tensor(
+                                    [source_uv_by_voxel.get(int(voxel_id), (np.nan, np.nan))
+                                     for voxel_id in sample_prior_voxel_ids[sample_ids]],
+                                    device=sample_depth.device, dtype=sample_depth.dtype)
+                                source_pair_valid, source_inconsistent = check_prior_depth_reprojection(
                                     sample_uv[source_ids], sample_depth[source_ids], viewpoint_cam.K,
-                                    viewpoint_cam.world_view_transform.T, source_depth, source_valid,
-                                    source_camera.K, source_camera.world_view_transform.T)
+                                    viewpoint_cam.world_view_transform.T, prior_source_uv,
+                                    source_camera.K, source_camera.world_view_transform.T, pixel_error_threshold=10)
                                 sample_prior_valid_votes[source_ids] += source_pair_valid
-                                sample_prior_far_votes[source_ids] += source_farther
-
+                                sample_prior_error_votes[source_ids] += source_inconsistent
 
                         # 至少两个共视帧同意且占严格多数；证据不足或平票保持未知。
-                        sample_prior_near_votes = sample_prior_valid_votes - sample_prior_far_votes
-                        sample_prior_missing = (sample_prior_far_votes >= 2) & (sample_prior_far_votes * 2 > sample_prior_valid_votes)
-                        sample_prior_not_missing = (sample_prior_near_votes >= 2) & (sample_prior_near_votes * 2 > sample_prior_valid_votes)
+                        sample_prior_consistent_votes = sample_prior_valid_votes - sample_prior_error_votes
+                        sample_prior_missing = (sample_prior_error_votes >= 2) & (sample_prior_error_votes * 2 > sample_prior_valid_votes)
+                        sample_prior_not_missing = (sample_prior_consistent_votes >= 2) & (sample_prior_consistent_votes * 2 > sample_prior_valid_votes)
                         sample_vacancy_state[sample_prior_missing] = 1
                         sample_vacancy_state[sample_prior_not_missing] = 0
 
-
-
+                        # # Debug: 仅显示 prior 候选点，颜色表示像素重投影误差过大的源视角数。
+                        # debug_support = sample_prior_error_votes.cpu().numpy()
+                        # debug_valid = sample_prior_valid_votes.cpu().numpy() > 0
+                        # debug_known = sample_prior_candidates & debug_valid
+                        # debug_unknown = sample_prior_candidates & ~debug_valid
+                        # fig, ax = plt.subplots(figsize=(14, 8))
+                        # ax.imshow(gt_image.detach().cpu().permute(1, 2, 0).clamp(0, 1).numpy())
+                        # ax.scatter(sample_x[debug_unknown], sample_y[debug_unknown],
+                        #            color='gray', marker='x', s=40, label='No valid comparison')
+                        # debug_max = max(1, int(debug_support[sample_prior_candidates].max(initial=0)))
+                        # points = ax.scatter(sample_x[debug_known], sample_y[debug_known],
+                        #                     c=debug_support[debug_known], s=45, edgecolors='black', linewidths=0.4,
+                        #                     cmap=plt.get_cmap('turbo', debug_max + 1), vmin=-0.5, vmax=debug_max + 0.5)
+                        # fig.colorbar(points, ax=ax, label='Views with large pixel reprojection error')
+                        # debug_has_coview = sample_prior_candidates & (debug_coview_counts > 0)
+                        # debug_no_coview = sample_prior_candidates & (debug_coview_counts == 0)
+                        # debug_coview_max = max(1, int(debug_coview_counts[sample_prior_candidates].max(initial=0)))
+                        # debug_coview_norm = plt.Normalize(vmin=0.5, vmax=debug_coview_max + 0.5)
+                        # debug_coview_cmap = plt.get_cmap('viridis', debug_coview_max)
+                        # ax.scatter(sample_x[debug_has_coview], sample_y[debug_has_coview],
+                        #            facecolors='none', edgecolors=debug_coview_cmap(debug_coview_norm(debug_coview_counts[debug_has_coview])),
+                        #            marker='o', s=150, linewidths=1.5, label='Prior co-visible count (ring)')
+                        # ax.scatter(sample_x[debug_no_coview], sample_y[debug_no_coview],
+                        #            facecolors='none', edgecolors='magenta', marker='o', s=150, linewidths=1.8,
+                        #            label=f'0 prior co-visible views: {debug_no_coview.sum()}')
+                        # fig.colorbar(plt.cm.ScalarMappable(norm=debug_coview_norm, cmap=debug_coview_cmap),
+                        #              ax=ax, label='Prior co-visible views (excluding ref)')
+                        # ax.set_title(f'Prior check | View {viewpoint_cam.id} | Iteration {iteration}')
+                        # ax.legend()
+                        # ax.set_axis_off()
+                        # plt.tight_layout()
+                        # plt.show()
 
             if _similarity < 0.8:
 
@@ -412,7 +437,7 @@ def training():
                 bkgd_mask = ~sky_mask & ~torch.any(dynamic_mask != 255, axis=0, keepdim=True)
                 k = int(len(acc[bkgd_mask]) * 0.25)
                 v = acc[bkgd_mask].kthvalue(k).values
-                    
+
                 if v.item() < 0.7:
                     flag_global_reconstruct = True
 
