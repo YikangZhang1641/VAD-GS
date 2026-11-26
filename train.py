@@ -266,6 +266,7 @@ def training():
                 sample_radius = int(round(128 + (grid_size - 128) * completion_progress))
                 with torch.no_grad():
                     segment_img = seg_bkgd_mask.detach().cpu().numpy().transpose(1, 2, 0)
+                    background_mask_np = background_mask.cpu().detach().numpy()[0]
                     # & ~np.all(segment_img == 0, axis=2)
                     # 动态区域不依赖背景 segment；背景跳过无效的分割颜色。
                     grid_origin_x, grid_origin_y = np.meshgrid(
@@ -276,7 +277,7 @@ def training():
                     # 边缘越界点及落在无效区域的点直接丢弃，不补采样。
                     inside = (sample_x < img_W) & (sample_y < img_H)
                     sample_x, sample_y = sample_x[inside], sample_y[inside]
-                    valid = background_mask[sample_y, sample_x]
+                    valid = background_mask_np[sample_y, sample_x]
                     sample_x, sample_y = sample_x[valid], sample_y[valid]
                     if len(sample_x) > max_samples:
                         selected_id = np.random.choice(len(sample_x), max_samples, replace=False)
@@ -450,7 +451,7 @@ def training():
                                 segment_known = segment_samples & (sampled_states >= 0)
                                 if segment_missing.sum() < 2: # or segment_missing.sum() <= segment_known.sum() * 0.5:
                                     continue
-                                segment_mask = np.all(segment_img == color, axis=2) & background_mask
+                                segment_mask = np.all(segment_img == color, axis=2) & background_mask_np
                                 segment_viewsets = []
 
                                 voxel_missing = segment_missing & sampled_has_voxel
@@ -483,7 +484,7 @@ def training():
                                      # 1125 暂时考虑只使用square mask和bkgd mask(只剔除sky与dynamic)，object mask只是用于统合视角集合的来源。
                                     reconstruct_local(
                                         ref_src_views, viewpoint_cam, viewpoint_full_stack, dataset, gaussians,
-                                        render_cache, mono_normal, local_render_pkg, reconstruction_mask=background_mask, #segment_mask,
+                                        render_cache, mono_normal, local_render_pkg, reconstruction_mask=background_mask_np, #segment_mask,
                                         missing_uv=np.column_stack((sample_x[missing_samples], sample_y[missing_samples])),
                                         iteration=iteration, optim_args=optim_args, gt_image=gt_image,
                                         sky_mask=sky_mask, dynamic_mask=dynamic_mask, sample_radius=sample_radius)
