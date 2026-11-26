@@ -234,9 +234,7 @@ def training():
             voxel_depth_value, voxel_depth_source, mask_visible, uvs = gaussians.background.grape_trellis.render_voxel_depth(current_view, img_H, img_W, K=viewpoint_cam.K)
             viewpoint_cam.guidance["bkgd_voxel"] = (voxel_depth_value.astype(np.float16), voxel_depth_source.astype(np.int32), mask_visible, uvs.astype(np.int16))
 
-        # flag_global_reconstruct = False
-        flag_local_reconstruct = False
-        flag_actor_reconstruct = False
+        background_mask = torch.all(dynamic_mask == 255, dim=0, keepdim=True) & ~sky_mask[0]
 
         ###################### hard depth #######################
         if view_stack_iter % optim_args.propagation_interval == 0 and iteration > optim_args.propagated_iteration_begin and iteration < optim_args.propagated_iteration_end:
@@ -394,6 +392,7 @@ def training():
                         # debug_unknown = sample_prior_candidates & ~debug_valid
                         # fig, ax = plt.subplots(figsize=(14, 8))
                         # ax.imshow(gt_image.detach().cpu().permute(1, 2, 0).clamp(0, 1).numpy())
+                        # # ax.imshow(segment_img)
                         # ax.scatter(sample_x[debug_unknown], sample_y[debug_unknown],
                         #            color='gray', marker='x', s=40, label='No valid comparison')
                         # debug_max = max(1, int(debug_support[sample_prior_candidates].max(initial=0)))
@@ -435,7 +434,7 @@ def training():
                                 segment_known = segment_samples & (sampled_states >= 0)
                                 if segment_missing.sum() < 2: # or segment_missing.sum() <= segment_known.sum() * 0.5:
                                     continue
-                                segment_mask = np.all(segment_img == color, axis=2) & background_pixels
+                                segment_mask = np.all(segment_img == color, axis=2) & background_mask
                                 segment_viewsets = []
 
                                 voxel_missing = segment_missing & sampled_has_voxel
@@ -468,7 +467,7 @@ def training():
                                      # 1125 暂时考虑只使用square mask和bkgd mask(只剔除sky与dynamic)，object mask只是用于统合视角集合的来源。
                                     reconstruct_local(
                                         ref_src_views, viewpoint_cam, viewpoint_full_stack, dataset, gaussians,
-                                        render_cache, mono_normal, local_render_pkg, reconstruction_mask=background_pixels, #segment_mask,
+                                        render_cache, mono_normal, local_render_pkg, reconstruction_mask=background_mask, #segment_mask,
                                         missing_uv=np.column_stack((sample_x[missing_samples], sample_y[missing_samples])),
                                         iteration=iteration, optim_args=optim_args, gt_image=gt_image,
                                         sky_mask=sky_mask, dynamic_mask=dynamic_mask, sample_radius=sample_radius)
@@ -538,8 +537,13 @@ def training():
                 scalar_dict['lidar_depth_loss'] = lidar_depth_loss
                 loss += optim_args.lambda_depth_lidar * lidar_depth_loss
 
-            if optim_args.use_voxel_depth:
-                depth_mask = torch.logical_and((voxel_depth_tensor > 0.), loss_mask)
+            if optim_args.use_voxel_depth: # 仅background
+                depth_mask = (
+                    depth_valid_mask
+                    & background_mask
+                    & torch.isfinite(voxel_depth_tensor)
+                    & (voxel_depth_tensor > 0.)
+                )
                 expected_depth = soft_render_pkg['depth'] / (soft_render_pkg['acc'] + 1e-10)  
                 depth_error = torch.abs((expected_depth[depth_mask] - voxel_depth_tensor[depth_mask[0]]))
                 depth_error, _ = torch.topk(depth_error, int(0.95 * depth_error.size(0)), largest=False)
