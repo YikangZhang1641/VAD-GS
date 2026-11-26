@@ -145,7 +145,7 @@ class ActorPose(nn.Module):
             rots1 = self.input_rots[frame_ind1, column_ind1]
             rots2 = self.input_rots[frame_ind2, column_ind2]
             theta1 = self.opt_rots[frame_ind1, column_ind1]
-            theta2 = self.opt_rots[frame_ind1, column_ind2]
+            theta2 = self.opt_rots[frame_ind2, column_ind2]
             rots1 = quaternion_raw_multiply_theta(rots1, theta1)
             rots2 = quaternion_raw_multiply_theta(rots1, theta2)
         else:
