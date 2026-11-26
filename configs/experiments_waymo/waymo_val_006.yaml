@@ -39,8 +39,7 @@ optim:
 
   propagated_iteration_begin: 1000
   propagated_iteration_end: 10000
-  propagation_interval: 5
-
+  propagation_interval: 29
   prune_box_interval: 100
   densification_interval: 100
   densify_from_iter: 500

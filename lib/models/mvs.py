@@ -236,6 +236,7 @@ def vggt_region_has_missing_depth(obj_mask, ref_camera, ref_depth, voxel_info,
     ref_depth and cached source depths are camera-Z depths normalized by opacity.
     The cache is shared across regions of one reference check, before insertion.
     """
+    # TODO(depth): 旧检测入口要求可信 camera-Z；仅正值/有限值无法确认 ref_depth 的定义或 acc 可信度。
     if voxel_info is None or 'vggt_voxel_id' not in ref_camera.guidance:
         return False
     y, x = np.nonzero(obj_mask)
@@ -287,6 +288,7 @@ def vggt_region_has_missing_depth(obj_mask, ref_camera, ref_depth, voxel_info,
             if view_id not in source_depth_cache:
                 rendered = renderer.render(camera, gaussians)
                 acc = rendered['acc'][0]
+                # TODO(depth): 与上方 normalized-depth 文档不符：除以 acc 被注释；即使 acc>0.5，raw depth 也不等于几何 Z。
                 depth = rendered['depth'][0] #/ acc.clamp_min(1e-6)
                 valid = torch.isfinite(depth) & (depth > 0) & (acc > 0.5)
                 sky = camera.guidance.get('sky_mask')
@@ -488,6 +490,7 @@ def depth_propagation(current_view, src_idxs, rendered_depth, rendered_normals, 
     dynamic_mask = viewpoint_cam.guidance['dynamic_mask']
 
     depth_min = 0.1 
+    # TODO(depth): 传播要求几何 Z；raw soft depth 会缩小初值/搜索上界，低 acc 的 depth/acc 离群值又可能放大上界。
     depth_max = max(rendered_depth.max(), 80)
     if vehicle_name is None: # bkgd
         all_mask = ~sky_mask[0] & ~torch.any(dynamic_mask != 255, axis=0)
@@ -512,6 +515,7 @@ def depth_propagation(current_view, src_idxs, rendered_depth, rendered_normals, 
 
     ### 生成./cache/depths 
 
+    # TODO(depth): 这里直接接收调用者深度，不做 acc/有效覆盖检查；不能在此无条件用 depth/acc 替换。
     depth_tensor = rendered_depth.contiguous().cuda()
     anchor_depth_tensor = depth_tensor.clone()  #viewpoint_cam.guidance['lidar_depth'][0].contiguous().cuda()
 
@@ -647,6 +651,7 @@ def depth_propagation_old(current_view, src_idxs, rendered_depth, rendered_norma
         ref_o2c = ref_w2c @ ref_o2w
 
     cv2.imwrite(os.path.join(cdata_depth_path, "0.png"), rendered_depth.astype(np.uint8))
+    # TODO(depth): 旧版传播也直接写入调用者深度；若来自 raw soft render，同样不是可信几何 Z。
     writeDepthDmb(os.path.join(cdata_depth_path, "0.dmb"), rendered_depth)
 
     # voxel depth?
@@ -751,6 +756,7 @@ def densify_bkgd_by_viewpoint(randidx, gt_image, optim_args, dataset, gaussians,
     viewpoint_cam = viewpoint_stack[randidx]
     render_pkg = gaussians_renderer.render(viewpoint_cam, gaussians, render_type="rgb", include_list=["background"])
     # image, acc, viewspace_point_tensor, visibility_filter, radii = render_pkg["rgb"], render_pkg['acc'], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+    # TODO(depth): 旧版背景补全仍用 raw soft depth 初始化传播，并与 propagated_depth 直接比较。
     rendered_depth = render_pkg['depth'][0] # [1, H, W]
     rendered_normals = render_pkg['normals']
 
@@ -813,6 +819,7 @@ def densify_bkgd_by_viewpoint(randidx, gt_image, optim_args, dataset, gaussians,
                 src_K = src_viewpoint.K
 
                 src_render_pkg = gaussians_renderer.render(src_viewpoint, gaussians, render_type="rgb", include_list=["background"])
+                # TODO(depth): 旧版背景补全的源帧也有相同 raw depth / 几何 Z 定义问题。
                 src_rendered_depth = src_render_pkg['depth'][0]
                 src_rendered_normal = src_render_pkg['normals']
                 

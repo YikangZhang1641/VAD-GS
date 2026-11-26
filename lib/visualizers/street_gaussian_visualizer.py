@@ -70,6 +70,7 @@ class StreetGaussianVisualizer():
         self.cams.append(camera.meta['cam'])
         id = camera.id
         rgb = result['rgb']
+        # NOTE(depth): 此图显示 sum(w*z)，颜色也受 acc 影响，并非归一化几何深度。
         depth = result['depth']
         depth = depth.permute(1, 2, 0).detach().cpu().numpy() # [H, W, 1]
         # np.save(os.path.join(self.result_dir, f'{id}_depth.npy'), depth)
@@ -108,6 +109,7 @@ class StreetGaussianVisualizer():
 
     def visualize_depth(self, result, camera: Camera):
         name = camera.image_name
+        # NOTE(depth): 此图显示 sum(w*z)，颜色也受 acc 影响，并非归一化几何深度。
         depth = result['depth']
 
         depth = depth.detach().permute(1, 2, 0).detach().cpu().numpy() # [H, W, 1]

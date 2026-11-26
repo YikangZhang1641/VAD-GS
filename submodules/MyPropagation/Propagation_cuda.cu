@@ -199,7 +199,7 @@ __device__ float4 GenerateRandomPlaneHypothesis(const Camera camera, const int2 
     // if (init_anchor > 1.14) {
     //     depth = init_anchor;
     // } else 
-    if (depth <= 0.1){
+    if (!isfinite(depth) || depth <= 0.1){
         depth = curand_uniform(rand_state) * (depth_max - depth_min) + depth_min;
     }
     // printf("initdepth: %f\n", init_depth);
@@ -345,13 +345,22 @@ __device__ float ComputeBilateralNCC(const cudaTextureObject_t ref_image, const 
 
     float H[9];
     ComputeHomography(ref_camera, src_camera, plane_hypothesis, H);
+
     float2 pt = ComputeCorrespondingPoint(H, p);
-    if (pt.x >= src_camera.width || pt.x < 0.0f || pt.y >= src_camera.height || pt.y < 0.0f) {
+
+    // 必须在转整数之前排除 NaN/Inf，并检查 source 图像边界。
+    if (!isfinite(pt.x) || !isfinite(pt.y) ||
+        pt.x < 0.0f || pt.x >= src_camera.width ||
+        pt.y < 0.0f || pt.y >= src_camera.height)
+    {
         return cost_max;
-    } 
-    
+    }
+
     const int p_center = p.y * src_camera.width + p.x;
-    const int pt_center = pt.y * src_camera.width + pt.x;
+
+    const int src_x = static_cast<int>(pt.x);
+    const int src_y = static_cast<int>(pt.y);
+    const int pt_center = src_y * src_camera.width + src_x;
     if (ref_mask[p_center] < 128 || src_mask[pt_center] < 128) { // zyk:  p点在ref和src落入mask则直接认为匹配错误
         return cost_max;
     }

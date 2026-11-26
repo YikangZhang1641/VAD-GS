@@ -67,6 +67,7 @@ class BaseVisualizer():
 
     def visualize_depth(self, result, camera: Camera):
         name = camera.image_name
+        # NOTE(depth): 显示/保存的是 sum(w*z)，包含 acc 的影响；导出的 depth.npy 不能直接作为几何 Z 使用。
         depth = result['depth']
 
         depth = depth.detach().permute(1, 2, 0).detach().cpu().numpy() # [H, W, 1]

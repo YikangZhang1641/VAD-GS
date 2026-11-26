@@ -177,6 +177,7 @@ class StreetGaussianRenderer():
         means2D = screenspace_points
         opacity = pc.get_opacity
         if render_type == "hard_depth":
+            # NOTE(depth): 只覆盖 opacity；像素 alpha 仍含高斯衰减，CUDA 仍输出 sum(w*z)，并非最近表面 Z。
             opacity = torch.ones(opacity.shape[0], 1, device=opacity.device) # * 0.95
 
         # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
@@ -214,6 +215,7 @@ class StreetGaussianRenderer():
         feature_dims = []
         features = []
         
+        # TODO(depth): hard_depth 不输出 normals；补全切换为 hard depth 时，仍需从普通渲染提供 normals/acc。
         if cfg.render.render_normal and render_type != "hard_depth":
             normals = pc.get_normals(viewpoint_camera)
 

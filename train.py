@@ -420,168 +420,60 @@ def training():
                         # plt.tight_layout()
                         # plt.show()
 
-            if _similarity < 0.8:
+                        # 4. 按采样命中的 segment 触发补全；未知点不参与缺失比例。
+                        if not optim_args.skip_view_selection:
+                            sampled_states = sample_vacancy_state.cpu().numpy()
+                            sampled_has_voxel = sample_voxel_comparable.cpu().numpy()
+                            sampled_colors, sampled_segment_ids = np.unique(
+                                segment_img[sample_y, sample_x], axis=0, return_inverse=True)
+                            _, local_voxel_sources, local_visible_voxels, _ = viewpoint_cam.guidance['bkgd_voxel']
+                            local_visible_ids = np.flatnonzero(local_visible_voxels)
+                            local_trellis = gaussians.background.grape_trellis
+                            for segment_id, color in enumerate(sampled_colors):
+                                segment_samples = sampled_segment_ids == segment_id
+                                segment_missing = segment_samples & (sampled_states == 1)
+                                segment_known = segment_samples & (sampled_states >= 0)
+                                if segment_missing.sum() < 2: # or segment_missing.sum() <= segment_known.sum() * 0.5:
+                                    continue
+                                segment_mask = np.all(segment_img == color, axis=2) & background_pixels
+                                segment_viewsets = []
 
-                hard_render_pkg = gaussians_renderer.render(viewpoint_cam, gaussians, render_type="hard_depth")
-                hard_depth = hard_render_pkg["depth"][0]
+                                voxel_missing = segment_missing & sampled_has_voxel
+                                if voxel_missing.any():
+                                    voxel_sources = np.unique(local_voxel_sources[sample_y[voxel_missing], sample_x[voxel_missing]])
+                                    voxel_sources = voxel_sources[voxel_sources >= 0]
+                                    voxel_selection = np.zeros_like(local_visible_voxels, dtype=np.bool_)
+                                    # depth_source 是可见体素子集内的索引，先还原为 trellis 全局索引。
+                                    voxel_selection[local_visible_ids[voxel_sources]] = True
+                                    if voxel_selection.any() and local_trellis.get_visibility()[voxel_selection].any():
+                                        trellis_ref_src_views, _, _ = local_trellis.sample_viewset_from_obj_mask(
+                                            current_view, voxel_selection, point_obs_ratio=0.5, N=4)
+                                        trellis_ref_src_views = [current_view] + [int(v) for v in trellis_ref_src_views[1:] if v in sample_allowed_views]
+                                        if len(trellis_ref_src_views) >= 3:
+                                            segment_viewsets.append((trellis_ref_src_views, voxel_missing))
 
-                voxel_depth_value, voxel_depth_source, mask_visible, uvs = viewpoint_cam.guidance["bkgd_voxel"]
-                voxel_depth_tensor = torch.from_numpy(voxel_depth_value).cuda()
+                                prior_missing = segment_missing & ~sampled_has_voxel
+                                if prior_missing.any():
+                                    prior_selection = np.zeros((img_H, img_W), dtype=np.bool_)
+                                    prior_selection[sample_y[prior_missing], sample_x[prior_missing]] = True
+                                    prior_ref_src_views, _ = local_trellis.sample_viewset_from_vggt_mask(
+                                        current_view, prior_selection, viewpoint_cam, sample_voxel_info,
+                                        point_obs_ratio=0.5, N=4, allowed_view_ids=train_view_ids)
+                                    if len(prior_ref_src_views) >= 3:
+                                        segment_viewsets.append((prior_ref_src_views, prior_missing))
 
-                m1 = (voxel_depth_tensor > 0) & (hard_depth > voxel_depth_tensor * 1.1) # 有初值。但是空了 missing points
-                if _similarity < 0.6 or m1.sum() > (voxel_depth_tensor > 0).sum() * 0.5:
-                    flag_global_reconstruct = True
-                if m1.sum() > (voxel_depth_tensor > 0).sum() * 0.2:
-                    flag_local_reconstruct = True
+                                # 两套视角暂分别调用；后续在此合并视角或划分补全区域。
+                                for ref_src_views, missing_samples in segment_viewsets:
+                                    local_render_pkg = soft_render_pkg
+                                     # 1125 暂时考虑只使用square mask和bkgd mask(只剔除sky与dynamic)，object mask只是用于统合视角集合的来源。
+                                    reconstruct_local(
+                                        ref_src_views, viewpoint_cam, viewpoint_full_stack, dataset, gaussians,
+                                        render_cache, mono_normal, local_render_pkg, reconstruction_mask=background_pixels, #segment_mask,
+                                        missing_uv=np.column_stack((sample_x[missing_samples], sample_y[missing_samples])),
+                                        iteration=iteration, optim_args=optim_args, gt_image=gt_image,
+                                        sky_mask=sky_mask, dynamic_mask=dynamic_mask, sample_radius=sample_radius)
 
-                bkgd_mask = ~sky_mask & ~torch.any(dynamic_mask != 255, axis=0, keepdim=True)
-                k = int(len(acc[bkgd_mask]) * 0.25)
-                v = acc[bkgd_mask].kthvalue(k).values
 
-                if v.item() < 0.7:
-                    flag_global_reconstruct = True
-
-                if v.item() < 0.9:
-                    flag_local_reconstruct = True
-
-                obj_render_pkg = gaussians_renderer.render_object(viewpoint_cam, gaussians) #, parse_camera_again=True)
-                obj_acc = obj_render_pkg["acc"]
-
-                actor_mask = torch.any(dynamic_mask != 255, axis=0, keepdim=True)
-
-                if len(obj_acc[actor_mask]) > 400:
-                    k = int(len(obj_acc[actor_mask]) * 0.25)
-                    v = obj_acc[actor_mask].kthvalue(k).values
-                    if v.item() < 0.7:
-                        flag_actor_reconstruct = True
-
-        with torch.no_grad():
-
-            ######################################################## BACKGROUND CONTINUOUS ###############################################################################
-            # if flag_global_reconstruct:
-            #     reconstruct_global(viewpoint_cam, viewpoint_full_stack, dataset, gaussians, gaussians_renderer,
-            #         cams_per_frame, iteration, optim_args, gt_image, sky_mask, dynamic_mask, mono_normal, soft_render_pkg)
-
-            ##################################### BACKGROUND DISCIRETE ##########################################################
-            if flag_local_reconstruct and not optim_args.skip_view_selection: #  or iteration > FULL_STACK_LENGTH * 5 and iteration < FULL_STACK_LENGTH * 20 and (iteration % optim_args.propagation_interval == 0):
-
-                voxel_depth_value, voxel_depth_source, mask_visible, uvs = viewpoint_cam.guidance["bkgd_voxel"]
-
-                segment_img = seg_bkgd_mask.cpu().detach().numpy().transpose(1,2,0)
-                no_bkgd_mask = np.logical_or(sky_mask.cpu().detach().numpy()[0], torch.any(dynamic_mask != 255, axis=0).cpu().detach().numpy())
-
-                if USE_TRELLIS:
-                    vacancy_exist, vacancy_colors = gaussians.background.grape_trellis.if_vacancy_in_ref_view_masks(voxel_depth_value, segment_img, no_bkgd_mask, vacancy_threshold=0.5)
-                else:
-                    vacancy_colors = []
-                    voxel_info = dataset.scene_info.metadata.get('vggt_voxel_info')
-                    if voxel_info is not None and 'vggt_voxel_id' in viewpoint_cam.guidance:
-                        soft_render_pkg = gaussians_renderer.render(viewpoint_cam, gaussians)
-                        # ref_depth = soft_render_pkg['depth'][0] / soft_render_pkg['acc'][0].clamp_min(1e-6)
-                        ref_depth = soft_render_pkg['depth'][0]
-                        source_depth_cache = {}
-                        for c in np.unique(segment_img.reshape(-1, 3), axis=0):
-                            if np.all(c == 0) or np.all(c == 1):
-                                continue
-                            obj_mask = np.all(segment_img == c, axis=2) & ~no_bkgd_mask
-                            if obj_mask.sum() < 100 * 100:
-                                continue
-                            if vggt_region_has_missing_depth(
-                                    obj_mask, viewpoint_cam, ref_depth, voxel_info,
-                                    viewpoint_full_stack, gaussians, gaussians_renderer,
-                                    source_depth_cache, train_view_ids):
-                                vacancy_colors.append(c)
-                    vacancy_exist = bool(vacancy_colors)
-                if vacancy_exist:
-                    # only for debug. 后续关闭
-                    soft_render_pkg = gaussians_renderer.render(viewpoint_cam, gaussians) #, render_type="hard_depth")
-
-                    rendered_depth = soft_render_pkg['depth'][0]
-                    rendered_normal = soft_render_pkg['normals']
-
-                    for c in vacancy_colors:
-                        obj_mask = np.all(segment_img == c, axis=2) & ~no_bkgd_mask
-                        use_trellis = USE_TRELLIS
-                        if use_trellis:
-                            selected_vals = obj_mask[uvs[mask_visible, 1], uvs[mask_visible, 0]]
-                            mask_visible_obj = mask_visible.copy()
-                            mask_visible_obj[mask_visible] &= selected_vals
-                            if mask_visible_obj.sum() < 10:
-                                continue
-                            ref_src_views, viewset_diversity_score, _ = gaussians.background.grape_trellis.sample_viewset_from_obj_mask(
-                                current_view, mask_visible_obj, point_obs_ratio=0.5, N=4)
-                        else:
-                            voxel_info = dataset.scene_info.metadata.get('vggt_voxel_info')
-                            ref_src_views, viewset_diversity_score = gaussians.background.grape_trellis.sample_viewset_from_vggt_mask(
-                                current_view, obj_mask, viewpoint_cam, voxel_info,
-                                point_obs_ratio=0.5, N=4, allowed_view_ids=train_view_ids,
-                            )
-
-                        # # Debug: reference first, followed by selected prior source views.
-                        # fig, axes = plt.subplots(1, len(ref_src_views), figsize=(5 * len(ref_src_views), 4), squeeze=False)
-                        # for i, view_id in enumerate(ref_src_views):
-                        #     camera = viewpoint_full_stack[view_id]
-                        #     axes[0, i].imshow(camera.original_image.detach().permute(1, 2, 0).cpu().numpy())
-                        #     axes[0, i].set_title(f"{'ref' if i == 0 else 'src'} {view_id}\n{camera.image_name}")
-                        #     axes[0, i].axis('off')
-                        # fig.tight_layout()
-                        # plt.show()
-
-                        reconstruct_local(ref_src_views, viewpoint_cam, viewpoint_full_stack, dataset, gaussians,
-                            gaussians_renderer, mono_normal, soft_render_pkg, reconstruction_mask=obj_mask,
-                            iteration=iteration, optim_args=optim_args, gt_image=gt_image,
-                            sky_mask=sky_mask, dynamic_mask=dynamic_mask)
-
-            ##################################################### OBJECT #######################################################################################
-            if flag_actor_reconstruct and not optim_args.skip_view_selection: # or iteration > FULL_STACK_LENGTH * 0 and iteration < FULL_STACK_LENGTH * 20 and (iteration % optim_args.propagation_interval == 0):
-                for dynamic_key in torch.unique(dynamic_mask):
-                    if dynamic_key == 255:
-                        continue
-
-                    dynamic_id = dynamic_key.item()
-                    obj_name = "obj_%.3d"%dynamic_id
-                    if obj_name not in include_list:
-                        continue
-
-                    obj_render_pkg = gaussians_renderer.render_object(viewpoint_cam, gaussians)
-
-                    rendered_normal = obj_render_pkg['normals']
-                    render_acc = obj_render_pkg['acc']
-
-                    if obj_name not in gaussians.graph_obj_list:
-                        continue
-
-                    obj_model = getattr(gaussians, obj_name)
-                    if obj_model.random_initialization or obj_model.deformable: # should be enough
-                        continue
-
-                    obj_mask = torch.any(dynamic_mask==dynamic_id, axis=0)
-                    obj_acc = render_acc[:, obj_mask]
-                    if (obj_acc < 0.5).sum() < (obj_acc > 0.9).sum() * 0.1:
-                        continue
-
-                    track_id = obj_model.track_id
-                    obj_views = dataset.scene_info.metadata["obj_view_dict"][track_id]
-                    if randidx not in obj_views:
-                        continue
-                    # Keep the reference ActorPose for projection, consistency and insertion.
-                    ref_o2w = get_actor_pose_world(gaussians.actor_pose, track_id, viewpoint_cam)
-                    obj_rots = ref_o2w[:3, :3].unsqueeze(0)
-                    obj_trans = ref_o2w[:3, 3]
-
-                    voxel_depth_value, voxel_depth_source, mask_visible, uvs = obj_model.grape_trellis.render_voxel_depth(current_view, img_H, img_W, K=viewpoint_cam.K, obj_rots=obj_rots, obj_trans=obj_trans)
-                    if mask_visible.sum() < 10:
-                        continue
-                    # 过低的 point_obs_ratio 可能没有输出。按逻辑而言需要在此处加入更新voxel部分
-                    ref_src_views, viewset_diversity_score, rootvine_xyz = obj_model.grape_trellis.sample_viewset_from_obj_mask(current_view, mask_visible, point_obs_ratio=0.4, N=4, obj_rots=obj_rots, obj_trans=obj_trans)
-
-                    if len(ref_src_views) <= 4 or viewset_diversity_score < DIVERSITY_THRES:
-                        continue
-
-                    # 视角已在上方选定，重建函数只负责传播、法线更新和加点。
-                    reconstruct_actor(ref_src_views, dynamic_id, viewpoint_cam, viewpoint_full_stack, dataset, gaussians,
-                        gaussians_renderer, iteration, optim_args, gt_image,
-                        sky_mask, dynamic_mask, mono_normal, obj_render_pkg)
 
         voxel_depth_value, voxel_depth_source, mask_visible, uvs = viewpoint_cam.guidance["bkgd_voxel"]
         voxel_depth_tensor = torch.from_numpy(voxel_depth_value).cuda()
