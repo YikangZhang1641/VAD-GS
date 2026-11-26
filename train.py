@@ -753,6 +753,7 @@ def training():
             # Densification
             if iteration < optim_args.densify_until_iter:
                 gaussians.set_visibility(include_list=list(set(gaussians.model_name_id.keys()) - set(['sky'])))
+                gaussians.parse_camera(viewpoint_cam)
                 gaussians.set_max_radii2D(radii, visibility_filter)
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
