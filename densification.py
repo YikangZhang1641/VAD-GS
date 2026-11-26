@@ -53,15 +53,15 @@ def reconstruct_global(viewpoint_cam, viewpoint_full_stack, dataset, gaussians, 
 
     # calculate the abs rel depth error of the propagated depth and rendered depth & render color error
     # NOTE(depth): 传播结果和缓存深度均按 camera-Z 定义，可比较相对深度误差。
-    abs_rel_error = torch.abs(propagated_depth - rendered_depth) / propagated_depth.clamp_min(1e-6)
-    depth_error_max_threshold = 1.0
-    depth_error_min_threshold = 0.8
-    abs_rel_error_threshold = depth_error_max_threshold - (depth_error_max_threshold - depth_error_min_threshold) * (iteration - optim_args.propagated_iteration_begin) / (optim_args.propagated_iteration_end - optim_args.propagated_iteration_begin)
-    # color error
-    render_color = soft_render_pkg['rgb']
+    # abs_rel_error = torch.abs(propagated_depth - rendered_depth) / propagated_depth.clamp_min(1e-6)
+    # depth_error_max_threshold = 1.0
+    # depth_error_min_threshold = 0.8
+    # abs_rel_error_threshold = depth_error_max_threshold - (depth_error_max_threshold - depth_error_min_threshold) * (iteration - optim_args.propagated_iteration_begin) / (optim_args.propagated_iteration_end - optim_args.propagated_iteration_begin)
+    # # color error
+    # render_color = soft_render_pkg['rgb']
 
     #for waymo, quantile 0.6; for free dataset, quantile 0.4
-    error_mask = (abs_rel_error > abs_rel_error_threshold)
+    # error_mask = (abs_rel_error > abs_rel_error_threshold)
 
     # calculate the geometric consistency
     ref_K = viewpoint_cam.K
@@ -98,7 +98,8 @@ def reconstruct_global(viewpoint_cam, viewpoint_full_stack, dataset, gaussians, 
     update_mask = (cost_mask & ~torch.any(dynamic_mask != 255, axis=0)).unsqueeze(0).repeat(3, 1, 1)
     mono_normal[update_mask] = propagated_normal[update_mask] #.cpu()
 
-    propagated_mask = valid_mask & ~error_mask & cost_mask # propagation有值 & 由渲染获得的D误差足够大 & 被多个视角共同观测 
+    # propagated_mask = valid_mask & ~error_mask & cost_mask # propagation有值 & 由渲染获得的D误差足够大 & 被多个视角共同观测 
+    propagated_mask = valid_mask & cost_mask # propagation有值 & 由渲染获得的D误差足够大 & 被多个视角共同观测 
     if sky_mask is not None:
         propagated_mask = propagated_mask & ~sky_mask[0]
 
@@ -242,22 +243,32 @@ def reconstruct_local(ref_src_views, viewpoint_cam, viewpoint_full_stack, datase
 @torch.no_grad()
 def reconstruct_actor(ref_src_views, dynamic_id, viewpoint_cam, viewpoint_full_stack, dataset, gaussians,
                       gaussians_renderer, iteration, optim_args, gt_image, sky_mask, dynamic_mask,
-                      mono_normal, obj_render_pkg):
+                      mono_normal, obj_render_pkg, *, missing_uv, sample_radius=16):
     """Complete an actor using caller-selected views and its reference render.
 
     ref_src_views contains the reference ID first, followed by source IDs.
     Actor eligibility and view selection are checked by the caller.
+    Insert points only within the actor mask and squares around missing samples.
     Update mono_normal in place.
     """
     
     randidx = viewpoint_cam.id
     obj_name = "obj_%.3d"%dynamic_id
-    # TODO(depth): actor 独立渲染的 raw depth 也受自身 acc 影响，当前直接作为 PatchMatch 的几何深度初值。
-    rendered_depth = obj_render_pkg['depth'][0]
-    rendered_normal = obj_render_pkg['normals']
     render_acc = obj_render_pkg['acc']
+    # 高覆盖区域使用 camera-Z；低覆盖区域不给深度初值，让 PatchMatch 搜索。
+    rendered_depth = torch.where(render_acc[0] >= 0.5,
+                                 obj_render_pkg['depth'][0] / render_acc[0].clamp_min(1e-6), 0.)
+    rendered_normal = obj_render_pkg['normals']
     obj_model = getattr(gaussians, obj_name)
     obj_mask = torch.any(dynamic_mask==dynamic_id, axis=0)
+    square_mask = torch.zeros_like(obj_mask)
+    height, width = obj_mask.shape
+    for u, v in missing_uv:
+        square_mask[max(0, v - sample_radius):min(height, v + sample_radius),
+                    max(0, u - sample_radius):min(width, u + sample_radius)] = True
+    obj_mask = obj_mask & square_mask
+    if sky_mask is not None:
+        obj_mask = obj_mask & ~sky_mask[0]
 
 
     track_id = obj_model.track_id
@@ -269,7 +280,9 @@ def reconstruct_actor(ref_src_views, dynamic_id, viewpoint_cam, viewpoint_full_s
 
     vehicle_name = int(dynamic_id)
     # Use the supplied source IDs directly; do not sample or rank views here.
-    src_idxs = ref_src_views[1:]
+    src_idxs = [src_idx for src_idx in ref_src_views[1:] if src_idx in obj_views and src_idx != randidx]
+    if len(src_idxs) < 2:
+        return
     propagated_depth, cost, propagated_normal = depth_propagation(randidx, src_idxs, rendered_depth, rendered_normal, viewpoint_full_stack, dataset, vehicle_name=vehicle_name, patch_size=20, actor_pose=gaussians.actor_pose)
     if propagated_depth is None:
         print("no props")
@@ -281,21 +294,11 @@ def reconstruct_actor(ref_src_views, dynamic_id, viewpoint_cam, viewpoint_full_s
     # propagated_depth = propagated_depth.to(rendered_depth.device)
     valid_mask = torch.isfinite(propagated_depth) & (propagated_depth > 0) & (propagated_depth != 300)
 
-    # calculate the abs rel depth error of the propagated depth and rendered depth & render color error
-    # TODO(depth): actor 的传播几何 Z 与 raw soft depth 定义不同，直接比较会错误影响 error_mask 和最终补点。
-    abs_rel_error = torch.abs(propagated_depth - rendered_depth) / propagated_depth.clamp_min(1e-6)
-    depth_error_max_threshold = 1.0
-    depth_error_min_threshold = 0.8
-    abs_rel_error_threshold = depth_error_max_threshold - (depth_error_max_threshold - depth_error_min_threshold) * (iteration - optim_args.propagated_iteration_begin) / (optim_args.propagated_iteration_end - optim_args.propagated_iteration_begin)
-    # color error
-
-    #for waymo, quantile 0.6; for free dataset, quantile 0.4
-    error_mask = (abs_rel_error > abs_rel_error_threshold)
-
     # Camera-to-object poses compensate motion in both reprojection directions.
     ref_K = viewpoint_cam.K
     ref_pose = (viewpoint_cam.world_view_transform.transpose(0, 1) @ ref_o2w).inverse()
     geometric_counts = None
+    valid_source_count = 0
     # for idx, src_idx in enumerate(src_idxs):
     for idx in range(len(src_idxs)):
         src_idx = src_idxs[idx]
@@ -306,10 +309,12 @@ def reconstruct_actor(ref_src_views, dynamic_id, viewpoint_cam, viewpoint_full_s
         src_o2w = get_actor_pose_world(gaussians.actor_pose, track_id, src_viewpoint)
         src_pose = (src_viewpoint.world_view_transform.transpose(0, 1) @ src_o2w).inverse()
 
-        # src_render_pkg = gaussians_renderer.render(src_viewpoint, gaussians) #, render_type="hard_depth")
-        src_render_pkg = gaussians_renderer.render_object(src_viewpoint, gaussians)
-        # TODO(depth): actor 源帧也直接使用 raw soft depth；需与参考帧同时处理深度定义和有效覆盖。
-        src_rendered_depth = src_render_pkg['depth'][0] 
+        gaussians.set_visibility([obj_name])
+        gaussians.parse_camera(src_viewpoint)
+        src_render_pkg = gaussians_renderer.render_kernel(src_viewpoint, gaussians)
+        src_acc = src_render_pkg['acc'][0]
+        src_rendered_depth = torch.where(src_acc >= 0.5,
+                                         src_render_pkg['depth'][0] / src_acc.clamp_min(1e-6), 0.)
         src_rendered_normal = src_render_pkg['normals']
 
         #get the src_depth first
@@ -320,6 +325,7 @@ def reconstruct_actor(ref_src_views, dynamic_id, viewpoint_cam, viewpoint_full_s
         if src_depth is None:
             print("no props")
             continue 
+        valid_source_count += 1
 
         # src_depth, cost, src_normal = read_propagted_depth('./cache/propagated_depth')
         # src_depth = torch.tensor(src_depth).cuda()
@@ -331,17 +337,17 @@ def reconstruct_actor(ref_src_views, dynamic_id, viewpoint_cam, viewpoint_full_s
         else:
             geometric_counts += mask.to(torch.uint8)
 
-    if geometric_counts is None:
+    if geometric_counts is None or valid_source_count < 2:
         return
     cost = geometric_counts.squeeze() # 这里cost大约代表各视角下共享视野的部分，越高代表被共同观测且匹配成功的视角越多
     # cost_mask = cost >= 2
-    cost_mask = cost >= len(src_idxs)*0.5 #0.75
+    cost_mask = cost >= valid_source_count*0.5
 
     # Update the supplied normal map; the caller writes it back to camera guidance.
-    update_mask = (cost_mask & obj_mask).unsqueeze(0).repeat(3, 1, 1)
+    update_mask = (cost_mask & valid_mask & obj_mask).unsqueeze(0).repeat(3, 1, 1)
     mono_normal[update_mask] = propagated_normal[update_mask]
 
-    propagated_mask = valid_mask & ~error_mask & cost_mask # propagation有值 & 由渲染获得的D误差足够大 & 被多个视角共同观测 
+    propagated_mask = valid_mask & cost_mask
     if sky_mask is not None:
         propagated_mask = propagated_mask & ~sky_mask[0]
 
@@ -351,20 +357,22 @@ def reconstruct_actor(ref_src_views, dynamic_id, viewpoint_cam, viewpoint_full_s
     if obj_mask is not None:
         propagated_mask = propagated_mask & obj_mask
 
-    if propagated_mask.sum() > 100:
+    valid_count = int(propagated_mask.sum())
+    if valid_count > 3:
         K = viewpoint_cam.K
         cam2target = viewpoint_cam.world_view_transform.transpose(0, 1).inverse()
+        
+        target_count = valid_count
+        
+        # actor_count = obj_model.get_xyz.shape[0]
+        # if actor_count < 1000:
+        #     target_count = min(valid_count // 2, 800)
+        # elif actor_count < 2000:
+        #     target_count = min(valid_count // 4, 500)
+        # elif actor_count < 4000:
+        #     target_count = min(valid_count // 8, 200)
+        # else:
+        #     target_count = min(valid_count // 16, 100)
 
-        actor_count = obj_model.get_xyz.shape[0]
-        if actor_count < 1000:
-            target_count = min(propagated_mask.sum() // 2, 800)
-        if actor_count < 2000:
-            target_count = min(propagated_mask.sum() // 4, 500)
-        elif actor_count < 4000:
-            target_count = min(propagated_mask.sum() // 8, 200)
-        else:
-            target_count = min(propagated_mask.sum() // 16, 100)
-
-        if target_count < 10:
-            return
+        # target_count = min(valid_count, max(10, target_count))
         obj_model.densify_from_depth_propagation(K, cam2target, propagated_depth, propagated_normal, propagated_mask.to(torch.bool), render_acc, gt_image, obj_rots, obj_trans, init_opacity=0.3, target_count=target_count) 

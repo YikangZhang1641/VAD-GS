@@ -408,9 +408,40 @@ class GaussianModelActor(GaussianModel):
         # line_set.colors = o3d.utility.Vector3dVector(np.array(line_colors))
 
         # FOR1 = o3d.geometry.TriangleMesh.create_coordinate_frame(size=5, origin=[0, 0, 0])
-        # o3d.visualization.draw_geometries([point_cloud, obj_origin, line_set, FOR1])
+        # o3d.visualization.draw_geometries([point_cloud, line_set, FOR1])
 ##############################
 
+
+        inside_bbox = ((object_coordinates_3D >= self.min_xyz) & (object_coordinates_3D <= self.max_xyz)).all(dim=-1)
+        filter_mask = filter_mask & inside_bbox
+
+        # 物体局部 3D 网格：每个有候选点的格子随机保留一点，再由下方采样限制总量。
+        use_grid_sampling = True
+        grid_bbox_scale = 1.0
+        grid_resolution = 32  # bbox 每个轴划分的格子数。
+        if use_grid_sampling:
+            bbox_center = (self.min_xyz + self.max_xyz) * 0.5
+            bbox_half = (self.max_xyz - self.min_xyz) * 0.5 * grid_bbox_scale
+            grid_min, grid_max = bbox_center - bbox_half, bbox_center + bbox_half
+            grid_mask = ((object_coordinates_3D >= grid_min) & (object_coordinates_3D <= grid_max)).all(dim=-1)
+            valid_indices = (filter_mask & grid_mask).reshape(-1).nonzero(as_tuple=True)[0]
+            if valid_indices.numel() == 0:
+                return
+            valid_xyz = object_coordinates_3D.reshape(-1, 3)[valid_indices]
+            grid_xyz = torch.floor((valid_xyz - grid_min) / ((grid_max - grid_min) / grid_resolution)).long()
+            grid_xyz = grid_xyz.clamp(0, grid_resolution - 1)
+            grid_ids = (grid_xyz[:, 0] * grid_resolution + grid_xyz[:, 1]) * grid_resolution + grid_xyz[:, 2]
+            order = torch.randperm(valid_indices.numel(), device=valid_indices.device)
+            order = order[torch.argsort(grid_ids[order])]
+            sorted_ids = grid_ids[order]
+            first_in_grid = torch.ones_like(sorted_ids, dtype=torch.bool)
+            first_in_grid[1:] = sorted_ids[1:] != sorted_ids[:-1]
+            grid_sample_mask = torch.zeros_like(filter_mask)
+            grid_sample_mask.view(-1)[valid_indices[order[first_in_grid]]] = True
+            filter_mask = grid_sample_mask
+
+        if not filter_mask.any():
+            return
 
         # object_coordinates_3D_downsampled = object_coordinates_3D[::8, ::8]
         # filter_mask_downsampled = filter_mask[::8, ::8]
@@ -419,14 +450,18 @@ class GaussianModelActor(GaussianModel):
         # object_coordinates_3D_downsampled = object_coordinates_3D_downsampled[filter_mask_downsampled]
         # color_downsampled = gt_image_downsampled[filter_mask_downsampled]
 
-        object_coordinates_3D_downsampled, color_downsampled, object_normal_downsampled = self.weighted_random_sampling(
-            world_coords=object_coordinates_3D,
-            colors=gt_image_permuted,
-            normals=obj_normal,
-            mask=filter_mask,
-            acc=acc,
-            target_count=target_count
-        )
+        object_coordinates_3D_downsampled = object_coordinates_3D[filter_mask]
+        color_downsampled = gt_image_permuted[filter_mask]
+        object_normal_downsampled = obj_normal[filter_mask]
+        
+        # object_coordinates_3D_downsampled, color_downsampled, object_normal_downsampled = self.weighted_random_sampling(
+        #     world_coords=object_coordinates_3D,
+        #     colors=gt_image_permuted,
+        #     normals=obj_normal,
+        #     mask=filter_mask,
+        #     acc=acc,
+        #     target_count=target_count
+        # )
 
 
         # import open3d as o3d

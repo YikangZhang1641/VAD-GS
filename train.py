@@ -247,249 +247,335 @@ def training():
             image = soft_render_pkg["rgb"]
             acc = soft_render_pkg['acc']
 
+            # 1. 共用网格采样：背景和 actor 使用同一组坐标、状态与补全半径。
+            grid_size, max_samples = 32, 512
+            completion_progress = np.clip(
+                (iteration - optim_args.propagated_iteration_begin) /
+                (optim_args.propagated_iteration_end - optim_args.propagated_iteration_begin), 0.0, 1.0)
+            sample_radius = int(round(128 + (grid_size - 128) * completion_progress))
+            background_mask_np = background_mask.detach().cpu().numpy()[0]
+            grid_origin_x, grid_origin_y = np.meshgrid(
+                np.arange(0, img_W, grid_size), np.arange(0, img_H, grid_size))
+            dx, dy = np.random.randint(0, grid_size, size=2)
+            sample_x = (grid_origin_x + dx).ravel()
+            sample_y = (grid_origin_y + dy).ravel()
+            inside = (sample_x < img_W) & (sample_y < img_H)
+            sample_x, sample_y = sample_x[inside], sample_y[inside]
+            valid = ~sky_mask[0, sample_y, sample_x].detach().cpu().numpy()
+            sample_x, sample_y = sample_x[valid], sample_y[valid]
+            if len(sample_x) > max_samples:
+                selected_id = np.random.choice(len(sample_x), max_samples, replace=False)
+                sample_x, sample_y = sample_x[selected_id], sample_y[selected_id]
+            sample_background_np = background_mask_np[sample_y, sample_x]
+            sample_background = torch.as_tensor(sample_background_np, device=image.device)
+            sample_dynamic_ids = dynamic_mask[:, sample_y, sample_x].detach().cpu().numpy()
+            # -1 未知，0 未缺失，1 缺失；重叠 actor 的各自状态另外保存。
+            sample_vacancy_state = torch.full((len(sample_x),), -1, dtype=torch.int8, device=image.device)
+            actor_sample_states = {}
+
             _similarity = ssim(image, gt_image, mask=loss_mask)
 
-            ######################################################## BACKGROUND CONTINUOUS ###############################################################################
-            # 1. 整体过差时走现有 global 调用；本分支不进行局部采样。
-            if _similarity < 0.6:
-                reconstruct_global(
-                    viewpoint_cam, viewpoint_full_stack, dataset, gaussians, render_cache, cams_per_frame, iteration, optim_args, gt_image, sky_mask, dynamic_mask, mono_normal, soft_render_pkg
-                )
-
-            else:
-                # 2. 用共用随机 offset 生成采样网格，再读取其 segment / 动态 ID。
-                # 每次检查重新抽样，仅限制总点数，不遍历整图 segment。
-                grid_size, max_samples = 32, 512
-                completion_progress = np.clip(
-                    (iteration - optim_args.propagated_iteration_begin) /
-                    (optim_args.propagated_iteration_end - optim_args.propagated_iteration_begin), 0.0, 1.0)
-                sample_radius = int(round(128 + (grid_size - 128) * completion_progress))
+            # 2. 背景分支：global 与静态区域检测 → local 二选一。
+            if sample_background_np.any():
+                # 2.1 仅检测静态采样点：低 acc、voxel 深度、prior 重投影。
                 with torch.no_grad():
                     segment_img = seg_bkgd_mask.detach().cpu().numpy().transpose(1, 2, 0)
-                    background_mask_np = background_mask.cpu().detach().numpy()[0]
-                    # & ~np.all(segment_img == 0, axis=2)
-                    # 动态区域不依赖背景 segment；背景跳过无效的分割颜色。
-                    grid_origin_x, grid_origin_y = np.meshgrid(
-                        np.arange(0, img_W, grid_size), np.arange(0, img_H, grid_size))
-                    dx, dy = np.random.randint(0, grid_size, size=2)
-                    sample_x = (grid_origin_x + dx).ravel()
-                    sample_y = (grid_origin_y + dy).ravel()
-                    # 边缘越界点及落在无效区域的点直接丢弃，不补采样。
-                    inside = (sample_x < img_W) & (sample_y < img_H)
-                    sample_x, sample_y = sample_x[inside], sample_y[inside]
-                    valid = background_mask_np[sample_y, sample_x]
-                    sample_x, sample_y = sample_x[valid], sample_y[valid]
-                    if len(sample_x) > max_samples:
-                        selected_id = np.random.choice(len(sample_x), max_samples, replace=False)
-                        sample_x, sample_y = sample_x[selected_id], sample_y[selected_id]
+                    sample_render_pkg = soft_render_pkg
+                    # NOTE(depth): 补全缓存已存 depth/acc；低 acc 点单独按覆盖不足判缺失。
+                    sample_depth_map = sample_render_pkg.get('depth', torch.zeros_like(sample_render_pkg['acc']))[0]
+                    sample_depth = sample_depth_map[sample_y, sample_x]
+                    sample_acc = sample_render_pkg['acc'][0, sample_y, sample_x]
+                    # 低覆盖直接视为缺失；整图 acc 和背景 voxel 均不用于 actor 检测。
+                    sample_low_acc = sample_background & (sample_acc < 0.5)
+                    sample_vacancy_state[sample_low_acc] = 1
 
-                    # 3. 与采样坐标一一对应：-1 未知，0 未缺失，1 缺失。
-                    # 当前只有背景 voxel；actor 点保留未知，避免用静态重投影判断运动物体。
-                    sample_vacancy_state = torch.full((len(sample_x),), -1, dtype=torch.int8, device=image.device)
-                    if len(sample_x):
-                        sample_render_pkg = soft_render_pkg
-                        # NOTE(depth): 补全缓存已存 depth/acc；低 acc 点单独按覆盖不足判缺失。
-                        sample_depth_map = sample_render_pkg.get('depth', torch.zeros_like(sample_render_pkg['acc']))[0]
-                        sample_depth = sample_depth_map[sample_y, sample_x]
-                        sample_acc = sample_render_pkg['acc'][0, sample_y, sample_x]
-                        # 采样点已限定为静态背景；低覆盖直接视为缺失，不再依赖其深度判断。
-                        sample_low_acc = sample_acc < 0.5
-                        sample_vacancy_state[sample_low_acc] = 1
+                    sample_voxel_depth = torch.as_tensor(
+                        viewpoint_cam.guidance['bkgd_voxel'][0][sample_y, sample_x],
+                        device=image.device, dtype=sample_depth.dtype)
 
-                        sample_voxel_depth = torch.as_tensor(
-                            viewpoint_cam.guidance['bkgd_voxel'][0][sample_y, sample_x],
-                            device=image.device, dtype=sample_depth.dtype)
+                    # TODO(depth): 非低 acc 点仍未验证渲染深度，0/NaN 会被判为未缺失。
+                    sample_voxel_comparable = sample_background & (sample_voxel_depth > 0) # & sample_render_valid
+                    # 保留 voxel 是否存在的信息供视角选择，只对非低 acc 点进行深度比较。
+                    sample_voxel_check = sample_voxel_comparable & ~sample_low_acc
+                    sample_vacancy_state[sample_voxel_check] = (
+                        sample_depth[sample_voxel_check] > sample_voxel_depth[sample_voxel_check] * 1.1
+                    ).to(torch.int8)
 
-                        # TODO(depth): 非低 acc 点仍未验证渲染深度，0/NaN 会被判为未缺失。
-                        sample_voxel_comparable = sample_voxel_depth > 0 # & sample_render_valid
-                        # 保留 voxel 是否存在的信息供视角选择，只对非低 acc 点进行深度比较。
-                        sample_voxel_check = sample_voxel_comparable & ~sample_low_acc
-                        sample_vacancy_state[sample_voxel_check] = (
-                            sample_depth[sample_voxel_check] > sample_voxel_depth[sample_voxel_check] * 1.1
-                        ).to(torch.int8)
+                    def check_prior_depth_reprojection(ref_uv, ref_depth, ref_K, ref_w2c,
+                                                       prior_src_uv, src_K, src_w2c,
+                                                       pixel_error_threshold=3.0):
+                        """比较深度投影位置与 prior 对应像素，返回 (可比较 mask, 像素误差过大 mask)。"""
+                        uv_h = torch.cat((ref_uv, torch.ones_like(ref_uv[:, :1])), dim=1)
+                        # NOTE(depth): ref_depth 为补全缓存中的归一化 camera-Z，低 acc 点已在候选筛选时排除。
+                        xyz_ref = (torch.linalg.inv(ref_K) @ uv_h.T).T * ref_depth[:, None]
+                        ref_to_src = src_w2c @ torch.linalg.inv(ref_w2c)
+                        xyz_src = xyz_ref @ ref_to_src[:3, :3].T + ref_to_src[:3, 3]
+                        projected = xyz_src @ src_K.T
+                        uv_src = projected[:, :2] / projected[:, 2:3]
+                        comparable = (
+                            torch.isfinite(ref_uv).all(dim=1)
+                            & torch.isfinite(ref_depth)
+                            & (ref_depth > 0)
+                            & torch.isfinite(prior_src_uv).all(dim=1)
+                            & (prior_src_uv >= 0).all(dim=1)
+                            & torch.isfinite(uv_src).all(dim=1)
+                            & (xyz_src[:, 2] > 0)
+                        )
+                        pixel_error = torch.linalg.norm(uv_src - prior_src_uv, dim=1)
+                        return comparable, comparable & (pixel_error > pixel_error_threshold)
 
-                        # # Debug Visualization
-                        # fig, ax = plt.subplots(figsize=(14, 8))
-                        # ax.imshow(gt_image.detach().cpu().permute(1, 2, 0).clamp(0, 1).numpy())
-                        # for state, label, color, marker in [(-1, "Unknown", "yellow", "x"), (0, "Not missing", "lime", "+"), (1, "Missing", "red", "o")]:
-                        #     selected = sample_vacancy_state.detach().cpu().numpy() == state
-                        #     style = {"facecolors": "none", "edgecolors": color} if marker == "o" else {"color": color}
-                        #     ax.scatter(sample_x[selected], sample_y[selected], marker=marker, s=45, linewidths=1.3, label=f"{label}: {selected.sum()}", **style)
-                        # ax.set_title(f"View {viewpoint_cam.id} | Iteration {iteration}")
-                        # ax.legend()
-                        # ax.set_axis_off()
-                        # plt.tight_layout()
-                        # plt.show()
+                    # 只对没有 voxel 且非低 acc 的点进行 prior 检测，避免覆盖低 acc 的缺失判定。
+                    sample_prior_candidates = (sample_background & ~sample_voxel_comparable & ~sample_low_acc).cpu().numpy()
+                    sample_voxel_info = dataset.scene_info.metadata.get('vggt_voxel_info')
+                    sample_allowed_views = set(train_view_ids)
+                    sample_ids_by_view = {}
+                    debug_coview_counts = np.zeros(len(sample_x), dtype=np.int32)
+                    for sample_id in np.flatnonzero(sample_prior_candidates):
+                        source_views = get_vggt_pixel_source_views(
+                            viewpoint_cam, sample_voxel_info, int(sample_x[sample_id]), int(sample_y[sample_id]))
+                        # 调试数量：排除 ref，保留 train/test，区分 prior 本就无共视与后续过滤失败。
+                        debug_coview_counts[sample_id] = np.count_nonzero(source_views != viewpoint_cam.id)
+                        for source_id in source_views:
+                            source_id = int(source_id)
+                            if source_id != viewpoint_cam.id and source_id in sample_allowed_views:
+                                sample_ids_by_view.setdefault(source_id, []).append(sample_id)
 
-                        def check_prior_depth_reprojection(ref_uv, ref_depth, ref_K, ref_w2c,
-                                                           prior_src_uv, src_K, src_w2c,
-                                                           pixel_error_threshold=3.0):
-                            """比较深度投影位置与 prior 对应像素，返回 (可比较 mask, 像素误差过大 mask)。"""
-                            uv_h = torch.cat((ref_uv, torch.ones_like(ref_uv[:, :1])), dim=1)
-                            # NOTE(depth): ref_depth 为补全缓存中的归一化 camera-Z，低 acc 点已在候选筛选时排除。
-                            xyz_ref = (torch.linalg.inv(ref_K) @ uv_h.T).T * ref_depth[:, None]
-                            ref_to_src = src_w2c @ torch.linalg.inv(ref_w2c)
-                            xyz_src = xyz_ref @ ref_to_src[:3, :3].T + ref_to_src[:3, 3]
-                            projected = xyz_src @ src_K.T
-                            uv_src = projected[:, :2] / projected[:, 2:3]
-                            comparable = (
-                                torch.isfinite(ref_uv).all(dim=1)
-                                & torch.isfinite(ref_depth)
-                                & (ref_depth > 0)
-                                & torch.isfinite(prior_src_uv).all(dim=1)
-                                & (prior_src_uv >= 0).all(dim=1)
-                                & torch.isfinite(uv_src).all(dim=1)
-                                & (xyz_src[:, 2] > 0)
+                    sample_prior_valid_votes = torch.zeros(len(sample_x), dtype=torch.int32, device=sample_depth.device)
+                    sample_prior_error_votes = torch.zeros_like(sample_prior_valid_votes)
+                    if sample_ids_by_view:
+                        sample_uv = torch.as_tensor(np.column_stack((sample_x, sample_y)), device=sample_depth.device, dtype=sample_depth.dtype)
+                        sample_prior_voxel_ids = viewpoint_cam.guidance['vggt_voxel_id'][sample_y, sample_x].cpu().numpy()
+                        # 每个源帧只扫描一次 ID 图，以同 ID 像素的中位位置作为 prior 对应点。
+                        for source_id, sample_ids in sample_ids_by_view.items():
+                            source_camera = viewpoint_full_stack[source_id]
+                            source_ids = torch.as_tensor(sample_ids, device=sample_depth.device, dtype=torch.long)
+                            source_voxel_ids = source_camera.guidance['vggt_voxel_id'].cpu().numpy()
+                            source_static = (~source_camera.guidance['sky_mask'][0].cpu().numpy()
+                                             & torch.all(source_camera.guidance['dynamic_mask'] == 255, dim=0).cpu().numpy())
+                            source_y, source_x = np.nonzero(
+                                np.isin(source_voxel_ids, sample_prior_voxel_ids[sample_ids]) & source_static)
+                            if not len(source_x):
+                                continue
+                            observed_ids = source_voxel_ids[source_y, source_x]
+                            order = np.argsort(observed_ids)
+                            voxel_ids, starts, counts = np.unique(observed_ids[order], return_index=True, return_counts=True)
+                            source_uv_by_voxel = {
+                                int(voxel_id): (np.median(source_x[order[start:start + count]]),
+                                                np.median(source_y[order[start:start + count]]))
+                                for voxel_id, start, count in zip(voxel_ids, starts, counts)
+                            }
+                            prior_source_uv = torch.as_tensor(
+                                [source_uv_by_voxel.get(int(voxel_id), (np.nan, np.nan))
+                                 for voxel_id in sample_prior_voxel_ids[sample_ids]],
+                                device=sample_depth.device, dtype=sample_depth.dtype)
+                            source_pair_valid, source_inconsistent = check_prior_depth_reprojection(
+                                sample_uv[source_ids], sample_depth[source_ids], viewpoint_cam.K,
+                                viewpoint_cam.world_view_transform.T, prior_source_uv,
+                                source_camera.K, source_camera.world_view_transform.T, pixel_error_threshold=10)
+                            sample_prior_valid_votes[source_ids] += source_pair_valid
+                            sample_prior_error_votes[source_ids] += source_inconsistent
+
+                    # 至少两个共视帧同意且占严格多数；证据不足或平票保持未知。
+                    sample_prior_consistent_votes = sample_prior_valid_votes - sample_prior_error_votes
+                    sample_prior_missing = (sample_prior_error_votes >= 2) & (sample_prior_error_votes * 2 > sample_prior_valid_votes)
+                    sample_prior_not_missing = (sample_prior_consistent_votes >= 2) & (sample_prior_consistent_votes * 2 > sample_prior_valid_votes)
+                    sample_vacancy_state[sample_prior_missing] = 1
+                    sample_vacancy_state[sample_prior_not_missing] = 0
+
+                    # # Debug: 仅显示 prior 候选点（无 voxel 且 acc >= 0.5）；叉号颜色表示缓存 acc。
+                    # debug_support = sample_prior_error_votes.cpu().numpy()
+                    # debug_acc = sample_acc.detach().cpu().numpy()
+                    # debug_valid = sample_prior_valid_votes.cpu().numpy() > 0
+                    # debug_known = sample_prior_candidates & debug_valid
+                    # debug_unknown = sample_prior_candidates & ~debug_valid
+                    # fig, ax = plt.subplots(figsize=(14, 8))
+                    # ax.imshow(gt_image.detach().cpu().permute(1, 2, 0).clamp(0, 1).numpy())
+                    # # ax.imshow(segment_img)
+                    # acc_points = ax.scatter(sample_x[debug_unknown], sample_y[debug_unknown],
+                    #                         c=debug_acc[debug_unknown], cmap='plasma', vmin=0, vmax=1,
+                    #                         marker='x', s=55, linewidths=1.5, label='No valid comparison (acc)')
+                    # fig.colorbar(acc_points, ax=ax, label='Cached render acc (cross)')
+                    # debug_max = max(1, int(debug_support[sample_prior_candidates].max(initial=0)))
+                    # points = ax.scatter(sample_x[debug_known], sample_y[debug_known],
+                    #                     c=debug_support[debug_known], s=45, edgecolors='black', linewidths=0.4,
+                    #                     cmap=plt.get_cmap('turbo', debug_max + 1), vmin=-0.5, vmax=debug_max + 0.5)
+                    # fig.colorbar(points, ax=ax, label='Views with large pixel reprojection error')
+                    # debug_has_coview = sample_prior_candidates & (debug_coview_counts > 0)
+                    # debug_no_coview = sample_prior_candidates & (debug_coview_counts == 0)
+                    # debug_coview_max = max(1, int(debug_coview_counts[sample_prior_candidates].max(initial=0)))
+                    # debug_coview_norm = plt.Normalize(vmin=0.5, vmax=debug_coview_max + 0.5)
+                    # debug_coview_cmap = plt.get_cmap('viridis', debug_coview_max)
+                    # ax.scatter(sample_x[debug_has_coview], sample_y[debug_has_coview],
+                    #            facecolors='none', edgecolors=debug_coview_cmap(debug_coview_norm(debug_coview_counts[debug_has_coview])),
+                    #            marker='o', s=150, linewidths=1.5, label='Prior co-visible count (ring)')
+                    # ax.scatter(sample_x[debug_no_coview], sample_y[debug_no_coview],
+                    #            facecolors='none', edgecolors='magenta', marker='o', s=150, linewidths=1.8,
+                    #            label=f'0 prior co-visible views: {debug_no_coview.sum()}')
+                    # fig.colorbar(plt.cm.ScalarMappable(norm=debug_coview_norm, cmap=debug_coview_cmap),
+                    #              ax=ax, label='Prior co-visible views (excluding ref)')
+                    # ax.set_title(f'Prior check | View {viewpoint_cam.id} | Iteration {iteration}')
+                    # ax.legend()
+                    # ax.set_axis_off()
+                    # plt.tight_layout()
+                    # plt.show()
+
+                    bg_count = sample_background.sum().float()
+                    bg_missing_ratio = (sample_background & (sample_vacancy_state == 1)).sum().float() / bg_count
+                    # 没有 voxel、没有有效 prior 比较，且覆盖不足。
+                    bg_unsupported_low_acc_ratio = (sample_background & ~sample_voxel_comparable & (sample_prior_valid_votes == 0) & (sample_acc < 0.8)).sum().float() / bg_count
+
+                    # 2.2.1 整体过差时直接进行背景 global 补全。
+                    if _similarity < 0.6 or bg_missing_ratio > 0.3 or bg_unsupported_low_acc_ratio > 0.1:
+                        reconstruct_global(
+                            viewpoint_cam, viewpoint_full_stack, dataset, gaussians, render_cache, cams_per_frame, iteration, optim_args, gt_image, sky_mask, dynamic_mask, mono_normal, soft_render_pkg
+                        )
+                    # 2.2.2 按静态 segment 汇集缺失点、选择视角并调用 reconstruct_local。
+                    elif not optim_args.skip_view_selection:
+                        sampled_states = sample_vacancy_state.cpu().numpy()
+                        sampled_has_voxel = sample_voxel_comparable.cpu().numpy()
+                        sampled_colors, sampled_segment_ids = np.unique(
+                            segment_img[sample_y, sample_x], axis=0, return_inverse=True)
+                        _, local_voxel_sources, local_visible_voxels, _ = viewpoint_cam.guidance['bkgd_voxel']
+                        local_visible_ids = np.flatnonzero(local_visible_voxels)
+                        local_trellis = gaussians.background.grape_trellis
+                        for segment_id, color in enumerate(sampled_colors):
+                            segment_samples = (sampled_segment_ids == segment_id) & sample_background_np
+                            segment_missing = segment_samples & (sampled_states == 1)
+                            segment_known = segment_samples & (sampled_states >= 0)
+                            if segment_missing.sum() < 2: # or segment_missing.sum() <= segment_known.sum() * 0.5:
+                                continue
+                            segment_mask = np.all(segment_img == color, axis=2) & background_mask_np
+                            segment_viewsets = []
+
+                            voxel_missing = segment_missing & sampled_has_voxel
+                            if voxel_missing.any():
+                                voxel_sources = np.unique(local_voxel_sources[sample_y[voxel_missing], sample_x[voxel_missing]])
+                                voxel_sources = voxel_sources[voxel_sources >= 0]
+                                voxel_selection = np.zeros_like(local_visible_voxels, dtype=np.bool_)
+                                # depth_source 是可见体素子集内的索引，先还原为 trellis 全局索引。
+                                voxel_selection[local_visible_ids[voxel_sources]] = True
+                                if voxel_selection.any() and local_trellis.get_visibility()[voxel_selection].any():
+                                    trellis_ref_src_views, _, _ = local_trellis.sample_viewset_from_obj_mask(
+                                        current_view, voxel_selection, point_obs_ratio=0.5, N=4)
+                                    trellis_ref_src_views = [current_view] + [int(v) for v in trellis_ref_src_views[1:] if v in sample_allowed_views]
+                                    if len(trellis_ref_src_views) >= 3:
+                                        segment_viewsets.append((trellis_ref_src_views, voxel_missing))
+
+                            prior_missing = segment_missing & ~sampled_has_voxel
+                            if prior_missing.any():
+                                prior_selection = np.zeros((img_H, img_W), dtype=np.bool_)
+                                prior_selection[sample_y[prior_missing], sample_x[prior_missing]] = True
+                                prior_ref_src_views, _ = local_trellis.sample_viewset_from_vggt_mask(
+                                    current_view, prior_selection, viewpoint_cam, sample_voxel_info,
+                                    point_obs_ratio=0.5, N=4, allowed_view_ids=train_view_ids)
+                                if len(prior_ref_src_views) >= 3:
+                                    segment_viewsets.append((prior_ref_src_views, prior_missing))
+
+                            # 两套视角暂分别调用；后续在此合并视角或划分补全区域。
+                            for ref_src_views, missing_samples in segment_viewsets:
+                                local_render_pkg = soft_render_pkg
+                                # 1125 暂时考虑只使用square mask和bkgd mask(只剔除sky与dynamic)，object mask只是用于统合视角集合的来源。
+                                reconstruct_local(
+                                    ref_src_views, viewpoint_cam, viewpoint_full_stack, dataset, gaussians,
+                                    render_cache, mono_normal, local_render_pkg, reconstruction_mask=background_mask_np, #segment_mask,
+                                    missing_uv=np.column_stack((sample_x[missing_samples], sample_y[missing_samples])),
+                                    iteration=iteration, optim_args=optim_args, gt_image=gt_image,
+                                    sky_mask=sky_mask, dynamic_mask=dynamic_mask, sample_radius=sample_radius)
+
+            # 3. Actor 分支：独立 acc 检测 → 共视帧选择 → reconstruct_actor。
+            # 与背景 global/local 分支平级；只渲染当前 actor 自身的 Gaussian。
+            if np.any(sample_dynamic_ids != 255):
+                actor_previous_include = list(gaussians.include_list)
+                actor_previous_camera = gaussians.viewpoint_camera
+                with torch.no_grad():
+                    try:
+                        for dynamic_id in np.unique(sample_dynamic_ids):
+                            dynamic_id = int(dynamic_id)
+                            obj_name = f"obj_{dynamic_id:03d}"
+                            if dynamic_id == 255 or obj_name not in gaussians.obj_list:
+                                continue
+                            actor_samples_np = np.any(sample_dynamic_ids == dynamic_id, axis=0)
+                            actor_samples = torch.as_tensor(actor_samples_np, device=image.device)
+                            gaussians.set_visibility([obj_name])
+                            gaussians.parse_camera(viewpoint_cam)
+                            if obj_name not in gaussians.graph_obj_list:
+                                continue
+                            obj_render_pkg = gaussians_renderer.render_kernel(viewpoint_cam, gaussians)
+                            actor_acc = obj_render_pkg["acc"][0, sample_y[actor_samples_np], sample_x[actor_samples_np]]
+                            actor_states = (actor_acc < 0.5).to(torch.int8)
+                            actor_sample_states[dynamic_id] = (actor_samples_np, actor_states.cpu().numpy())
+                            # 一个像素可能属于多个 actor；合并图中任一 actor 缺失就标为缺失。
+                            sample_vacancy_state[actor_samples] = torch.maximum(sample_vacancy_state[actor_samples], actor_states)
+                            actor_missing = actor_states.cpu().numpy() == 1
+                            if actor_missing.sum() < 2 or actor_missing.mean() < 0.1 or optim_args.skip_view_selection:
+                                continue
+
+                            obj_model = getattr(gaussians, obj_name)
+                            if obj_model.random_initialization or obj_model.deformable or obj_model.grape_trellis is None:
+                                continue
+                            obj_views = dataset.scene_info.metadata["obj_view_dict"][obj_model.track_id]
+                            if current_view not in obj_views:
+                                continue
+                            # voxel 只提供共视关系，不投影 voxel，也不使用其坐标或深度。
+                            visibility = obj_model.grape_trellis.get_visibility()
+                            actor_visibility = visibility[visibility[:, current_view]]
+                            if not len(actor_visibility):
+                                continue
+                            candidates = [int(v) for v in train_view_ids if v != current_view and v in obj_views and actor_visibility[:, v].any()]
+                            ref_src_views = [current_view]
+                            uncovered = np.ones(len(actor_visibility), dtype=np.bool_)
+                            for _ in range(min(4, len(candidates))):
+                                coverage = actor_visibility[uncovered][:, candidates].sum(axis=0)
+                                if not coverage.any():
+                                    coverage = actor_visibility[:, candidates].sum(axis=0)
+                                selected = int(np.random.choice(np.flatnonzero(coverage == coverage.max())))
+                                source_id = candidates.pop(selected)
+                                ref_src_views.append(source_id)
+                                uncovered &= ~actor_visibility[:, source_id]
+                            if len(ref_src_views) < 3:
+                                continue
+
+                            reconstruct_actor(ref_src_views, dynamic_id, viewpoint_cam, viewpoint_full_stack, dataset, gaussians, gaussians_renderer, 
+                                iteration, optim_args, gt_image, sky_mask, dynamic_mask, mono_normal, obj_render_pkg, sample_radius=sample_radius,
+                                missing_uv=np.column_stack((sample_x[actor_samples_np][actor_missing], sample_y[actor_samples_np][actor_missing]))
                             )
-                            pixel_error = torch.linalg.norm(uv_src - prior_src_uv, dim=1)
-                            return comparable, comparable & (pixel_error > pixel_error_threshold)
+                    finally:
+                        gaussians.set_visibility(actor_previous_include)
+                        gaussians.parse_camera(actor_previous_camera)
 
-                        # 只对没有 voxel 且非低 acc 的点进行 prior 检测，避免覆盖低 acc 的缺失判定。
-                        sample_prior_candidates = (~sample_voxel_comparable & ~sample_low_acc).cpu().numpy()
-                        sample_voxel_info = dataset.scene_info.metadata.get('vggt_voxel_info')
-                        sample_allowed_views = set(train_view_ids)
-                        sample_ids_by_view = {}
-                        debug_coview_counts = np.zeros(len(sample_x), dtype=np.int32)
-                        for sample_id in np.flatnonzero(sample_prior_candidates):
-                            source_views = get_vggt_pixel_source_views(
-                                viewpoint_cam, sample_voxel_info, int(sample_x[sample_id]), int(sample_y[sample_id]))
-                            # 调试数量：排除 ref，保留 train/test，区分 prior 本就无共视与后续过滤失败。
-                            debug_coview_counts[sample_id] = np.count_nonzero(source_views != viewpoint_cam.id)
-                            for source_id in source_views:
-                                source_id = int(source_id)
-                                if source_id != viewpoint_cam.id and source_id in sample_allowed_views:
-                                    sample_ids_by_view.setdefault(source_id, []).append(sample_id)
-
-                        sample_prior_valid_votes = torch.zeros(len(sample_x), dtype=torch.int32, device=sample_depth.device)
-                        sample_prior_error_votes = torch.zeros_like(sample_prior_valid_votes)
-                        if sample_ids_by_view:
-                            sample_uv = torch.as_tensor(np.column_stack((sample_x, sample_y)), device=sample_depth.device, dtype=sample_depth.dtype)
-                            sample_prior_voxel_ids = viewpoint_cam.guidance['vggt_voxel_id'][sample_y, sample_x].cpu().numpy()
-                            # 每个源帧只扫描一次 ID 图，以同 ID 像素的中位位置作为 prior 对应点。
-                            for source_id, sample_ids in sample_ids_by_view.items():
-                                source_camera = viewpoint_full_stack[source_id]
-                                source_ids = torch.as_tensor(sample_ids, device=sample_depth.device, dtype=torch.long)
-                                source_voxel_ids = source_camera.guidance['vggt_voxel_id'].cpu().numpy()
-                                source_static = (~source_camera.guidance['sky_mask'][0].cpu().numpy()
-                                                 & torch.all(source_camera.guidance['dynamic_mask'] == 255, dim=0).cpu().numpy())
-                                source_y, source_x = np.nonzero(
-                                    np.isin(source_voxel_ids, sample_prior_voxel_ids[sample_ids]) & source_static)
-                                if not len(source_x):
-                                    continue
-                                observed_ids = source_voxel_ids[source_y, source_x]
-                                order = np.argsort(observed_ids)
-                                voxel_ids, starts, counts = np.unique(observed_ids[order], return_index=True, return_counts=True)
-                                source_uv_by_voxel = {
-                                    int(voxel_id): (np.median(source_x[order[start:start + count]]),
-                                                    np.median(source_y[order[start:start + count]]))
-                                    for voxel_id, start, count in zip(voxel_ids, starts, counts)
-                                }
-                                prior_source_uv = torch.as_tensor(
-                                    [source_uv_by_voxel.get(int(voxel_id), (np.nan, np.nan))
-                                     for voxel_id in sample_prior_voxel_ids[sample_ids]],
-                                    device=sample_depth.device, dtype=sample_depth.dtype)
-                                source_pair_valid, source_inconsistent = check_prior_depth_reprojection(
-                                    sample_uv[source_ids], sample_depth[source_ids], viewpoint_cam.K,
-                                    viewpoint_cam.world_view_transform.T, prior_source_uv,
-                                    source_camera.K, source_camera.world_view_transform.T, pixel_error_threshold=10)
-                                sample_prior_valid_votes[source_ids] += source_pair_valid
-                                sample_prior_error_votes[source_ids] += source_inconsistent
-
-                        # 至少两个共视帧同意且占严格多数；证据不足或平票保持未知。
-                        sample_prior_consistent_votes = sample_prior_valid_votes - sample_prior_error_votes
-                        sample_prior_missing = (sample_prior_error_votes >= 2) & (sample_prior_error_votes * 2 > sample_prior_valid_votes)
-                        sample_prior_not_missing = (sample_prior_consistent_votes >= 2) & (sample_prior_consistent_votes * 2 > sample_prior_valid_votes)
-                        sample_vacancy_state[sample_prior_missing] = 1
-                        sample_vacancy_state[sample_prior_not_missing] = 0
-
-                        # # Debug: 仅显示 prior 候选点，颜色表示像素重投影误差过大的源视角数。
-                        # debug_support = sample_prior_error_votes.cpu().numpy()
-                        # debug_valid = sample_prior_valid_votes.cpu().numpy() > 0
-                        # debug_known = sample_prior_candidates & debug_valid
-                        # debug_unknown = sample_prior_candidates & ~debug_valid
-                        # fig, ax = plt.subplots(figsize=(14, 8))
-                        # ax.imshow(gt_image.detach().cpu().permute(1, 2, 0).clamp(0, 1).numpy())
-                        # # ax.imshow(segment_img)
-                        # ax.scatter(sample_x[debug_unknown], sample_y[debug_unknown],
-                        #            color='gray', marker='x', s=40, label='No valid comparison')
-                        # debug_max = max(1, int(debug_support[sample_prior_candidates].max(initial=0)))
-                        # points = ax.scatter(sample_x[debug_known], sample_y[debug_known],
-                        #                     c=debug_support[debug_known], s=45, edgecolors='black', linewidths=0.4,
-                        #                     cmap=plt.get_cmap('turbo', debug_max + 1), vmin=-0.5, vmax=debug_max + 0.5)
-                        # fig.colorbar(points, ax=ax, label='Views with large pixel reprojection error')
-                        # debug_has_coview = sample_prior_candidates & (debug_coview_counts > 0)
-                        # debug_no_coview = sample_prior_candidates & (debug_coview_counts == 0)
-                        # debug_coview_max = max(1, int(debug_coview_counts[sample_prior_candidates].max(initial=0)))
-                        # debug_coview_norm = plt.Normalize(vmin=0.5, vmax=debug_coview_max + 0.5)
-                        # debug_coview_cmap = plt.get_cmap('viridis', debug_coview_max)
-                        # ax.scatter(sample_x[debug_has_coview], sample_y[debug_has_coview],
-                        #            facecolors='none', edgecolors=debug_coview_cmap(debug_coview_norm(debug_coview_counts[debug_has_coview])),
-                        #            marker='o', s=150, linewidths=1.5, label='Prior co-visible count (ring)')
-                        # ax.scatter(sample_x[debug_no_coview], sample_y[debug_no_coview],
-                        #            facecolors='none', edgecolors='magenta', marker='o', s=150, linewidths=1.8,
-                        #            label=f'0 prior co-visible views: {debug_no_coview.sum()}')
-                        # fig.colorbar(plt.cm.ScalarMappable(norm=debug_coview_norm, cmap=debug_coview_cmap),
-                        #              ax=ax, label='Prior co-visible views (excluding ref)')
-                        # ax.set_title(f'Prior check | View {viewpoint_cam.id} | Iteration {iteration}')
-                        # ax.legend()
-                        # ax.set_axis_off()
-                        # plt.tight_layout()
-                        # plt.show()
-
-                        # 4. 按采样命中的 segment 触发补全；未知点不参与缺失比例。
-                        if not optim_args.skip_view_selection:
-                            sampled_states = sample_vacancy_state.cpu().numpy()
-                            sampled_has_voxel = sample_voxel_comparable.cpu().numpy()
-                            sampled_colors, sampled_segment_ids = np.unique(
-                                segment_img[sample_y, sample_x], axis=0, return_inverse=True)
-                            _, local_voxel_sources, local_visible_voxels, _ = viewpoint_cam.guidance['bkgd_voxel']
-                            local_visible_ids = np.flatnonzero(local_visible_voxels)
-                            local_trellis = gaussians.background.grape_trellis
-                            for segment_id, color in enumerate(sampled_colors):
-                                segment_samples = sampled_segment_ids == segment_id
-                                segment_missing = segment_samples & (sampled_states == 1)
-                                segment_known = segment_samples & (sampled_states >= 0)
-                                if segment_missing.sum() < 2: # or segment_missing.sum() <= segment_known.sum() * 0.5:
-                                    continue
-                                segment_mask = np.all(segment_img == color, axis=2) & background_mask_np
-                                segment_viewsets = []
-
-                                voxel_missing = segment_missing & sampled_has_voxel
-                                if voxel_missing.any():
-                                    voxel_sources = np.unique(local_voxel_sources[sample_y[voxel_missing], sample_x[voxel_missing]])
-                                    voxel_sources = voxel_sources[voxel_sources >= 0]
-                                    voxel_selection = np.zeros_like(local_visible_voxels, dtype=np.bool_)
-                                    # depth_source 是可见体素子集内的索引，先还原为 trellis 全局索引。
-                                    voxel_selection[local_visible_ids[voxel_sources]] = True
-                                    if voxel_selection.any() and local_trellis.get_visibility()[voxel_selection].any():
-                                        trellis_ref_src_views, _, _ = local_trellis.sample_viewset_from_obj_mask(
-                                            current_view, voxel_selection, point_obs_ratio=0.5, N=4)
-                                        trellis_ref_src_views = [current_view] + [int(v) for v in trellis_ref_src_views[1:] if v in sample_allowed_views]
-                                        if len(trellis_ref_src_views) >= 3:
-                                            segment_viewsets.append((trellis_ref_src_views, voxel_missing))
-
-                                prior_missing = segment_missing & ~sampled_has_voxel
-                                if prior_missing.any():
-                                    prior_selection = np.zeros((img_H, img_W), dtype=np.bool_)
-                                    prior_selection[sample_y[prior_missing], sample_x[prior_missing]] = True
-                                    prior_ref_src_views, _ = local_trellis.sample_viewset_from_vggt_mask(
-                                        current_view, prior_selection, viewpoint_cam, sample_voxel_info,
-                                        point_obs_ratio=0.5, N=4, allowed_view_ids=train_view_ids)
-                                    if len(prior_ref_src_views) >= 3:
-                                        segment_viewsets.append((prior_ref_src_views, prior_missing))
-
-                                # 两套视角暂分别调用；后续在此合并视角或划分补全区域。
-                                for ref_src_views, missing_samples in segment_viewsets:
-                                    local_render_pkg = soft_render_pkg
-                                     # 1125 暂时考虑只使用square mask和bkgd mask(只剔除sky与dynamic)，object mask只是用于统合视角集合的来源。
-                                    reconstruct_local(
-                                        ref_src_views, viewpoint_cam, viewpoint_full_stack, dataset, gaussians,
-                                        render_cache, mono_normal, local_render_pkg, reconstruction_mask=background_mask_np, #segment_mask,
-                                        missing_uv=np.column_stack((sample_x[missing_samples], sample_y[missing_samples])),
-                                        iteration=iteration, optim_args=optim_args, gt_image=gt_image,
-                                        sky_mask=sky_mask, dynamic_mask=dynamic_mask, sample_radius=sample_radius)
-
-
+            # 4. 统一可视化：两个分支结束后绘制；纯背景视角也可使用。
+            # 圆圈为背景、方框为 actor；重叠 actor 分别绘制。
+            # fig, ax = plt.subplots(figsize=(14, 8))
+            # ax.imshow(gt_image.detach().cpu().permute(1, 2, 0).clamp(0, 1).numpy())
+            # debug_states = sample_vacancy_state.cpu().numpy()
+            # debug_groups = [('background', sample_background_np, debug_states[sample_background_np], 'o')]
+            # debug_groups += [(f'obj_{actor_id:03d}', selected, states, 's')
+            #                     for actor_id, (selected, states) in actor_sample_states.items()]
+            # # 红色半透明区域为 actor 缺失采样点的方形邻域，并裁剪到该 actor mask。
+            # debug_actor_region = np.zeros((img_H, img_W), dtype=np.bool_)
+            # for actor_id, (selected, states) in actor_sample_states.items():
+            #     square_region = np.zeros_like(debug_actor_region)
+            #     for u, v in zip(sample_x[selected][states == 1], sample_y[selected][states == 1]):
+            #         square_region[max(0, v - sample_radius):min(img_H, v + sample_radius),
+            #                         max(0, u - sample_radius):min(img_W, u + sample_radius)] = True
+            #     debug_actor_region |= square_region & torch.any(dynamic_mask == actor_id, dim=0).cpu().numpy()
+            # debug_overlay = np.zeros((img_H, img_W, 4))
+            # debug_overlay[debug_actor_region] = [1., 0., 0., 0.2]
+            # ax.imshow(debug_overlay)
+            # # 缺失状态最后绘制，防止重叠 actor 的健康标记遮住缺失标记。
+            # for state, label, color in [(-1, 'Unknown', 'yellow'), (0, 'Covered', 'lime'), (1, 'Missing', 'red')]:
+            #     for name, selected, states, marker in debug_groups:
+            #         xs, ys = sample_x[selected], sample_y[selected]
+            #         pick = states == state
+            #         if pick.any():
+            #             ax.scatter(xs[pick], ys[pick], marker=marker, s=55,
+            #                         facecolors='none', edgecolors=color, linewidths=1.3,
+            #                         label=f'{name} {label}: {pick.sum()}')
+            # ax.set_title(f'Vacancy | View {current_view} | Iteration {iteration} | radius {sample_radius}')
+            # ax.legend(fontsize=8)
+            # ax.set_axis_off()
+            # fig.tight_layout()
+            # plt.show()
 
         voxel_depth_value, voxel_depth_source, mask_visible, uvs = viewpoint_cam.guidance["bkgd_voxel"]
         voxel_depth_tensor = torch.from_numpy(voxel_depth_value).cuda()
