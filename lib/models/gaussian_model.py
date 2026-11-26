@@ -751,6 +751,7 @@ class GaussianModel(nn.Module):
         # scales = self.scaling_inverse_activation(quantile_scale.unsqueeze(0).repeat(fused_point_cloud.shape[0], 1))
         fused_shape = fused_point_cloud.shape[0]
         all_point_cloud = torch.concat([fused_point_cloud, original_point_cloud], dim=0)
+        torch.cuda.empty_cache()
         all_dist2 = torch.clamp_min(distCUDA2(all_point_cloud), 0.0000001)
         dist2 = all_dist2[:fused_shape]        
         scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
@@ -773,7 +774,7 @@ class GaussianModel(nn.Module):
         axis[~mask][:, 0] = 0
         axis[~mask][:, 1] = 0
         axis[~mask][:, 2] = 1
-        half_theta = torch.arccos(world_normal_downsampled[:,2:3]) / 2
+        half_theta = torch.arccos(world_normal_downsampled[:,2:3].clamp(-1., 1.)) / 2
         q_w = torch.cos(half_theta)
         q_xyz = axis * torch.sin(half_theta)
         rots = torch.hstack([q_w, q_xyz]).float().cuda()
