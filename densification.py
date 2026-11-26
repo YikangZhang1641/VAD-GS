@@ -5,9 +5,9 @@ from lib.models.mvs import depth_propagation, check_geometric_consistency, get_a
 
 
 @torch.no_grad()
-def reconstruct_global(viewpoint_cam, viewpoint_full_stack, dataset, gaussians, gaussians_renderer,
+def reconstruct_global(viewpoint_cam, viewpoint_full_stack, dataset, gaussians, render_cache,
                        cams_per_frame, iteration, optim_args, gt_image, sky_mask, dynamic_mask, mono_normal, soft_render_pkg):
-    """Complete the reference background; update mono_normal in place."""
+    """Complete the reference background using the previous training stack's render cache."""
     randidx = viewpoint_cam.id
     FULL_STACK_LENGTH = len(viewpoint_full_stack)
     visibility = gaussians.background.grape_trellis.get_visibility()
@@ -15,31 +15,32 @@ def reconstruct_global(viewpoint_cam, viewpoint_full_stack, dataset, gaussians, 
     src_idxs = []
 
     pre = randidx - cams_per_frame
-    while pre >= 0 and visibility[:, pre].sum() == 0:
+    while pre >= 0 and (pre not in render_cache or visibility[:, pre].sum() == 0):
         pre -= cams_per_frame
     if pre >= 0:
         src_idxs.append(pre)
 
     pre -= cams_per_frame
-    while pre >= 0 and visibility[:, pre].sum() == 0:
+    while pre >= 0 and (pre not in render_cache or visibility[:, pre].sum() == 0):
         pre -= cams_per_frame
     if pre >= 0:
         src_idxs.append(pre)
 
     post = randidx + cams_per_frame
-    while post < FULL_STACK_LENGTH and visibility[:, post].sum() == 0:
+    while post < FULL_STACK_LENGTH and (post not in render_cache or visibility[:, post].sum() == 0):
         post += cams_per_frame
     if post < FULL_STACK_LENGTH:
         src_idxs.append(post)
 
     post += cams_per_frame
-    while post < FULL_STACK_LENGTH and visibility[:, post].sum() == 0:
+    while post < FULL_STACK_LENGTH and (post not in render_cache or visibility[:, post].sum() == 0):
         post += cams_per_frame
     if post < FULL_STACK_LENGTH:
-        src_idxs.append(post)        
-    # # only for debug. 后续关闭
-    # soft_render_pkg = gaussians_renderer.render(viewpoint_cam, gaussians) #, render_type="hard_depth")
+        src_idxs.append(post)
+    if not src_idxs:
+        return
 
+    # TODO(depth): 缓存已归一化为 depth/acc；低 acc 区域的传播初值仍需考虑覆盖可信度。
     rendered_depth = soft_render_pkg['depth'][0] 
     rendered_normal = soft_render_pkg['normals']
 
@@ -51,6 +52,7 @@ def reconstruct_global(viewpoint_cam, viewpoint_full_stack, dataset, gaussians, 
     valid_mask = propagated_depth != 300
 
     # calculate the abs rel depth error of the propagated depth and rendered depth & render color error
+    # NOTE(depth): 传播结果和缓存深度均按 camera-Z 定义，可比较相对深度误差。
     abs_rel_error = torch.abs(propagated_depth - rendered_depth) / propagated_depth.clamp_min(1e-6)
     depth_error_max_threshold = 1.0
     depth_error_min_threshold = 0.8
@@ -73,7 +75,8 @@ def reconstruct_global(viewpoint_cam, viewpoint_full_stack, dataset, gaussians, 
         src_pose = src_viewpoint.world_view_transform.transpose(0, 1).inverse()
         src_K = src_viewpoint.K
 
-        src_render_pkg = gaussians_renderer.render(src_viewpoint, gaussians) #, render_type="hard_depth")
+        src_render_pkg = {key: render_cache[src_idx][key].to(rendered_depth.device) for key in ('depth', 'normals')}
+        # NOTE(depth): 源帧与参考帧均读取上一轮归一化后的缓存深度。
         src_rendered_depth = src_render_pkg['depth'][0]
         src_rendered_normal = src_render_pkg['normals']
 
@@ -120,9 +123,9 @@ def reconstruct_global(viewpoint_cam, viewpoint_full_stack, dataset, gaussians, 
 
 @torch.no_grad()
 def reconstruct_local(ref_src_views, viewpoint_cam, viewpoint_full_stack, dataset, gaussians,
-                      gaussians_renderer, mono_normal, soft_render_pkg, *, reconstruction_mask,
-                      iteration, optim_args, gt_image, sky_mask, dynamic_mask):
-    """Complete the supplied mask/views; update mono_normal in place."""
+                      render_cache, mono_normal, soft_render_pkg, *, reconstruction_mask, missing_uv,
+                      iteration, optim_args, gt_image, sky_mask, dynamic_mask, sample_radius=16):
+    """Complete background squares using cached renders; sample_radius is the half-side length."""
     # # Debug: reference first, followed by selected prior source views.
     # fig, axes = plt.subplots(1, len(ref_src_views), figsize=(5 * len(ref_src_views), 4), squeeze=False)
     # for i, view_id in enumerate(ref_src_views):
@@ -134,12 +137,23 @@ def reconstruct_local(ref_src_views, viewpoint_cam, viewpoint_full_stack, datase
     # plt.show()
     
     randidx = viewpoint_cam.id
-    src_idxs = ref_src_views[1:]
+    src_idxs = [view_id for view_id in ref_src_views[1:] if view_id in render_cache]
+    if len(src_idxs) < 2:
+        return
+    # TODO(depth): 缓存已归一化为 depth/acc；低 acc 区域的传播初值仍需考虑覆盖可信度。
     rendered_depth = soft_render_pkg['depth'][0]
     rendered_normal = soft_render_pkg['normals']
     if torch.is_tensor(reconstruction_mask):
         reconstruction_mask = reconstruction_mask.detach().cpu().numpy()
     obj_mask = np.asarray(reconstruction_mask, dtype=np.bool_)
+    # obj_mask = np.ones_like(reconstruction_mask, dtype=np.bool_)
+    
+    square_mask = np.zeros_like(obj_mask)
+    height, width = obj_mask.shape
+    for u, v in missing_uv:
+        square_mask[max(0, v - sample_radius):min(height, v + sample_radius),
+                    max(0, u - sample_radius):min(width, u + sample_radius)] = True
+    obj_mask = obj_mask & square_mask
 
     # depth_propagation(randidx, src_idxs, rendered_depth.detach().cpu().numpy(), rendered_normal.detach().cpu().numpy().transpose(1,2,0), viewpoint_full_stack, dataset, vehicle_name=None, patch_size=20)
     propagated_depth, cost, propagated_normal = depth_propagation(randidx, src_idxs, rendered_depth, rendered_normal, viewpoint_full_stack, dataset, vehicle_name=None, patch_size=20)
@@ -149,16 +163,15 @@ def reconstruct_local(ref_src_views, viewpoint_cam, viewpoint_full_stack, datase
     valid_mask = torch.isfinite(propagated_depth) & (propagated_depth > 0) & (propagated_depth != 300)
 
     # calculate the abs rel depth error of the propagated depth and rendered depth & render color error
-    render_depth = soft_render_pkg['depth'][0]
-    abs_rel_error = torch.abs(propagated_depth - render_depth) / propagated_depth.clamp_min(1e-6)
-    depth_error_max_threshold = 1.0
-    depth_error_min_threshold = 0.8
-    abs_rel_error_threshold = depth_error_max_threshold - (depth_error_max_threshold - depth_error_min_threshold) * (iteration - optim_args.propagated_iteration_begin) / (optim_args.propagated_iteration_end - optim_args.propagated_iteration_begin)
-    # color error
-    render_color = soft_render_pkg['rgb']
+    # abs_rel_error = torch.abs(propagated_depth - rendered_depth) / propagated_depth.clamp_min(1e-6)
+    # depth_error_max_threshold = 1.0
+    # depth_error_min_threshold = 0.8
+    # abs_rel_error_threshold = depth_error_max_threshold - (depth_error_max_threshold - depth_error_min_threshold) * (iteration - optim_args.propagated_iteration_begin) / (optim_args.propagated_iteration_end - optim_args.propagated_iteration_begin)
+    # # color error
+    # render_color = soft_render_pkg['rgb']
 
-    #for waymo, quantile 0.6; for free dataset, quantile 0.4
-    error_mask = (abs_rel_error > abs_rel_error_threshold)
+    #for waymo, quantile 0.6; for free dataset, quantile 0.4 需要确认是否起作用。
+    # error_mask = (abs_rel_error > abs_rel_error_threshold)
     
     # calculate the geometric consistency
     ref_K = viewpoint_cam.K
@@ -172,7 +185,8 @@ def reconstruct_local(ref_src_views, viewpoint_cam, viewpoint_full_stack, datase
         src_pose = src_viewpoint.world_view_transform.transpose(0, 1).inverse()
         src_K = src_viewpoint.K
 
-        src_render_pkg = gaussians_renderer.render(src_viewpoint, gaussians) #, render_type="hard_depth")
+        src_render_pkg = {key: render_cache[src_idx][key].to(rendered_depth.device) for key in ('depth', 'normals')}
+        # NOTE(depth): 源帧与参考帧均读取上一轮归一化后的缓存深度。
         src_rendered_depth = src_render_pkg['depth'][0]
         src_rendered_normal = src_render_pkg['normals']
 
@@ -195,7 +209,8 @@ def reconstruct_local(ref_src_views, viewpoint_cam, viewpoint_full_stack, datase
     update_mask = (cost_mask & valid_mask & torch.from_numpy(obj_mask).to(cost_mask.device)).unsqueeze(0).repeat(3, 1, 1)
     mono_normal[update_mask] = propagated_normal[update_mask] #.cpu()
     
-    propagated_mask = valid_mask & ~error_mask & cost_mask # propagation有值 & 由渲染获得的D误差足够大 & 被多个视角共同观测 
+    # propagated_mask = valid_mask & ~error_mask & cost_mask # propagation有值 & 由渲染获得的D误差足够大 & 被多个视角共同观测 
+    propagated_mask = valid_mask & cost_mask # propagation有值 & 由渲染获得的D误差足够大 & 被多个视角共同观测 
     if sky_mask is not None:
         propagated_mask = propagated_mask & ~sky_mask[0]
 
@@ -205,16 +220,19 @@ def reconstruct_local(ref_src_views, viewpoint_cam, viewpoint_full_stack, datase
     obj_mask = torch.from_numpy(obj_mask).to(propagated_mask.device)
     propagated_mask = propagated_mask & obj_mask
     
-    if propagated_mask.sum() > 100:
+    valid_count = int(propagated_mask.sum())
+    if valid_count > 3:
         K = viewpoint_cam.K
         cam2target = viewpoint_cam.world_view_transform.transpose(0, 1).inverse()
-        bkgd_count = gaussians.background.get_xyz.shape[0]
-        if bkgd_count < 1e6:
-            target_count = propagated_mask.sum()
-        elif bkgd_count < 2e6:
-            target_count = propagated_mask.sum() // 4
-        else:
-            target_count = propagated_mask.sum() // 16
+        target_count = valid_count
+
+        # bkgd_count = gaussians.background.get_xyz.shape[0]
+        # if bkgd_count < 1e6:
+        #     target_count = valid_count
+        # elif bkgd_count < 2e6:
+        #     target_count = max(1, valid_count // 4)
+        # else:
+        #     target_count = max(1, valid_count // 16)
         # only for debug. 后续关闭
         acc = soft_render_pkg['acc']
         gaussians.background.densify_from_depth_propagation(K, cam2target, propagated_depth, propagated_normal, propagated_mask.to(torch.bool), acc, gt_image, init_opacity=0.3, target_count=target_count) 
@@ -234,6 +252,7 @@ def reconstruct_actor(ref_src_views, dynamic_id, viewpoint_cam, viewpoint_full_s
     
     randidx = viewpoint_cam.id
     obj_name = "obj_%.3d"%dynamic_id
+    # TODO(depth): actor 独立渲染的 raw depth 也受自身 acc 影响，当前直接作为 PatchMatch 的几何深度初值。
     rendered_depth = obj_render_pkg['depth'][0]
     rendered_normal = obj_render_pkg['normals']
     render_acc = obj_render_pkg['acc']
@@ -263,6 +282,7 @@ def reconstruct_actor(ref_src_views, dynamic_id, viewpoint_cam, viewpoint_full_s
     valid_mask = torch.isfinite(propagated_depth) & (propagated_depth > 0) & (propagated_depth != 300)
 
     # calculate the abs rel depth error of the propagated depth and rendered depth & render color error
+    # TODO(depth): actor 的传播几何 Z 与 raw soft depth 定义不同，直接比较会错误影响 error_mask 和最终补点。
     abs_rel_error = torch.abs(propagated_depth - rendered_depth) / propagated_depth.clamp_min(1e-6)
     depth_error_max_threshold = 1.0
     depth_error_min_threshold = 0.8
@@ -288,6 +308,7 @@ def reconstruct_actor(ref_src_views, dynamic_id, viewpoint_cam, viewpoint_full_s
 
         # src_render_pkg = gaussians_renderer.render(src_viewpoint, gaussians) #, render_type="hard_depth")
         src_render_pkg = gaussians_renderer.render_object(src_viewpoint, gaussians)
+        # TODO(depth): actor 源帧也直接使用 raw soft depth；需与参考帧同时处理深度定义和有效覆盖。
         src_rendered_depth = src_render_pkg['depth'][0] 
         src_rendered_normal = src_render_pkg['normals']
 

@@ -183,6 +183,8 @@ def training():
     N_bkgd_init = gaussians.background.get_xyz.shape[0]
 
     viewpoint_stack = None
+    render_cache = {}
+    next_render_cache = {}
     for iteration in range(start_iter, training_args.iterations + 1):
 
         iter_start.record()
@@ -194,10 +196,13 @@ def training():
 
         # Pick a random Camera
         if not viewpoint_stack:
+            # 当前轮只读取上一完整训练轮的结果，本轮渲染另存，避免混用新旧视角。
+            render_cache = next_render_cache
+            next_render_cache = {}
             viewpoint_stack = scene.getTrainCameras().copy()
             view_stack_iter += 1
         # only for debug. 后续关闭
-        # viewpoint_cam = viewpoint_full_stack[143]
+        # viewpoint_cam = viewpoint_full_stack[21]
         viewpoint_cam: Camera = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
         randidx = viewpoint_cam.id
 
@@ -237,8 +242,8 @@ def training():
         background_mask = torch.all(dynamic_mask == 255, dim=0, keepdim=True) & ~sky_mask[0]
 
         ###################### hard depth #######################
-        if view_stack_iter % optim_args.propagation_interval == 0 and iteration > optim_args.propagated_iteration_begin and iteration < optim_args.propagated_iteration_end:
-            soft_render_pkg = gaussians_renderer.render(viewpoint_cam, gaussians)
+        if view_stack_iter % optim_args.propagation_interval == 0 and iteration > optim_args.propagated_iteration_begin and iteration < optim_args.propagated_iteration_end and randidx in render_cache:
+            soft_render_pkg = {key: value.to(gt_image.device) for key, value in render_cache[randidx].items()}
             image = soft_render_pkg["rgb"]
             acc = soft_render_pkg['acc']
 
@@ -248,17 +253,19 @@ def training():
             # 1. 整体过差时走现有 global 调用；本分支不进行局部采样。
             if _similarity < 0.6:
                 reconstruct_global(
-                    viewpoint_cam, viewpoint_full_stack, dataset, gaussians, gaussians_renderer, cams_per_frame, iteration, optim_args, gt_image, sky_mask, dynamic_mask, mono_normal, soft_render_pkg
+                    viewpoint_cam, viewpoint_full_stack, dataset, gaussians, render_cache, cams_per_frame, iteration, optim_args, gt_image, sky_mask, dynamic_mask, mono_normal, soft_render_pkg
                 )
 
             else:
                 # 2. 用共用随机 offset 生成采样网格，再读取其 segment / 动态 ID。
                 # 每次检查重新抽样，仅限制总点数，不遍历整图 segment。
                 grid_size, max_samples = 32, 512
+                completion_progress = np.clip(
+                    (iteration - optim_args.propagated_iteration_begin) /
+                    (optim_args.propagated_iteration_end - optim_args.propagated_iteration_begin), 0.0, 1.0)
+                sample_radius = int(round(128 + (grid_size - 128) * completion_progress))
                 with torch.no_grad():
                     segment_img = seg_bkgd_mask.detach().cpu().numpy().transpose(1, 2, 0)
-                    dynamic_img = dynamic_mask.detach().cpu().numpy()
-                    background_pixels = np.all(dynamic_img == 255, axis=0) & ~sky_mask[0].cpu().numpy() 
                     # & ~np.all(segment_img == 0, axis=2)
                     # 动态区域不依赖背景 segment；背景跳过无效的分割颜色。
                     grid_origin_x, grid_origin_y = np.meshgrid(
@@ -269,7 +276,7 @@ def training():
                     # 边缘越界点及落在无效区域的点直接丢弃，不补采样。
                     inside = (sample_x < img_W) & (sample_y < img_H)
                     sample_x, sample_y = sample_x[inside], sample_y[inside]
-                    valid = background_pixels[sample_y, sample_x]
+                    valid = background_mask[sample_y, sample_x]
                     sample_x, sample_y = sample_x[valid], sample_y[valid]
                     if len(sample_x) > max_samples:
                         selected_id = np.random.choice(len(sample_x), max_samples, replace=False)
@@ -279,17 +286,25 @@ def training():
                     # 当前只有背景 voxel；actor 点保留未知，避免用静态重投影判断运动物体。
                     sample_vacancy_state = torch.full((len(sample_x),), -1, dtype=torch.int8, device=image.device)
                     if len(sample_x):
-                        sample_render_pkg = gaussians_renderer.render(viewpoint_cam, gaussians) # , render_type="hard_depth")
+                        sample_render_pkg = soft_render_pkg
+                        # NOTE(depth): 补全缓存已存 depth/acc；低 acc 点单独按覆盖不足判缺失。
                         sample_depth_map = sample_render_pkg.get('depth', torch.zeros_like(sample_render_pkg['acc']))[0]
                         sample_depth = sample_depth_map[sample_y, sample_x]
+                        sample_acc = sample_render_pkg['acc'][0, sample_y, sample_x]
+                        # 采样点已限定为静态背景；低覆盖直接视为缺失，不再依赖其深度判断。
+                        sample_low_acc = sample_acc < 0.5
+                        sample_vacancy_state[sample_low_acc] = 1
 
                         sample_voxel_depth = torch.as_tensor(
                             viewpoint_cam.guidance['bkgd_voxel'][0][sample_y, sample_x],
                             device=image.device, dtype=sample_depth.dtype)
 
+                        # TODO(depth): 非低 acc 点仍未验证渲染深度，0/NaN 会被判为未缺失。
                         sample_voxel_comparable = sample_voxel_depth > 0 # & sample_render_valid
-                        sample_vacancy_state[sample_voxel_comparable] = (
-                            sample_depth[sample_voxel_comparable] > sample_voxel_depth[sample_voxel_comparable] * 1.1
+                        # 保留 voxel 是否存在的信息供视角选择，只对非低 acc 点进行深度比较。
+                        sample_voxel_check = sample_voxel_comparable & ~sample_low_acc
+                        sample_vacancy_state[sample_voxel_check] = (
+                            sample_depth[sample_voxel_check] > sample_voxel_depth[sample_voxel_check] * 1.1
                         ).to(torch.int8)
 
                         # # Debug Visualization
@@ -310,6 +325,7 @@ def training():
                                                            pixel_error_threshold=3.0):
                             """比较深度投影位置与 prior 对应像素，返回 (可比较 mask, 像素误差过大 mask)。"""
                             uv_h = torch.cat((ref_uv, torch.ones_like(ref_uv[:, :1])), dim=1)
+                            # NOTE(depth): ref_depth 为补全缓存中的归一化 camera-Z，低 acc 点已在候选筛选时排除。
                             xyz_ref = (torch.linalg.inv(ref_K) @ uv_h.T).T * ref_depth[:, None]
                             ref_to_src = src_w2c @ torch.linalg.inv(ref_w2c)
                             xyz_src = xyz_ref @ ref_to_src[:3, :3].T + ref_to_src[:3, 3]
@@ -327,8 +343,8 @@ def training():
                             pixel_error = torch.linalg.norm(uv_src - prior_src_uv, dim=1)
                             return comparable, comparable & (pixel_error > pixel_error_threshold)
 
-                        # 只对没有 voxel 的采样点查询 prior；几何函数拒绝无效 ref 深度。
-                        sample_prior_candidates = (~sample_voxel_comparable).cpu().numpy()
+                        # 只对没有 voxel 且非低 acc 的点进行 prior 检测，避免覆盖低 acc 的缺失判定。
+                        sample_prior_candidates = (~sample_voxel_comparable & ~sample_low_acc).cpu().numpy()
                         sample_voxel_info = dataset.scene_info.metadata.get('vggt_voxel_info')
                         sample_allowed_views = set(train_view_ids)
                         sample_ids_by_view = {}
@@ -480,6 +496,7 @@ def training():
         if iteration > optim_args.hard_depth_start and iteration < optim_args.hard_depth_end:
             loss_hard = 0
             hard_render_pkg = gaussians_renderer.render(viewpoint_cam, gaussians, render_type="hard_depth")
+            # TODO(depth): hard 模式只将 opacity 设为 1，仍输出 sum(w*z)；稀疏覆盖处并非真实表面 Z，当前 patch 深度损失未筛选覆盖。
             hard_depth = hard_render_pkg["depth"]
 
             patch_range = (min(hard_depth.shape[1], hard_depth.shape[2]) // 20, max(hard_depth.shape[1], hard_depth.shape[2]) // 10) # zyk: to be tuned
@@ -498,6 +515,12 @@ def training():
                 gaussians.update_optimizer()
 
         soft_render_pkg = gaussians_renderer.render(viewpoint_cam, gaussians)
+        # 缓存下一轮需要的图像，CPU 存储且不保留训练计算图或逐高斯数据。
+        next_render_cache[randidx] = {
+            key: soft_render_pkg[key].detach().to('cpu', copy=True)
+            for key in ('rgb', 'depth', 'normals', 'acc')}
+        # 仅在独立缓存中归一化深度，供下一轮的检测、传播和深度误差比较使用。
+        next_render_cache[randidx]['depth'] /= next_render_cache[randidx]['acc'].clamp_min(1e-6)
         image, acc, viewspace_point_tensor, visibility_filter, radii = soft_render_pkg["rgb"], soft_render_pkg['acc'], soft_render_pkg["viewspace_points"], soft_render_pkg["visibility_filter"], soft_render_pkg["radii"]
 
         scalar_dict = dict()
@@ -528,14 +551,20 @@ def training():
 
         # lidar depth loss
         if optim_args.lambda_depth_lidar > 0: 
+            depth_render = soft_render_pkg['depth']
+            depth_acc = soft_render_pkg['acc']
+            # 先筛选可信像素，再归一化；低 acc 不参与监督，分母保留梯度。
+            depth_valid_mask = (loss_mask & torch.isfinite(depth_render) & (depth_render > 0.)
+                                & torch.isfinite(depth_acc) & (depth_acc > 0.8))
             if optim_args.use_lidar_depth and lidar_depth is not None:           
-                depth_mask = torch.logical_and((lidar_depth > 0.), loss_mask)
-                expected_depth = soft_render_pkg['depth'] / (soft_render_pkg['acc'] + 1e-10)  
-                depth_error = torch.abs((expected_depth[depth_mask] - lidar_depth[depth_mask]))
-                depth_error, _ = torch.topk(depth_error, int(0.95 * depth_error.size(0)), largest=False)
-                lidar_depth_loss = depth_error.mean()
-                scalar_dict['lidar_depth_loss'] = lidar_depth_loss
-                loss += optim_args.lambda_depth_lidar * lidar_depth_loss
+                depth_mask = depth_valid_mask & torch.isfinite(lidar_depth) & (lidar_depth > 0.)
+                expected_depth = depth_render[depth_mask] / depth_acc[depth_mask]
+                depth_error = torch.abs(expected_depth - lidar_depth[depth_mask])
+                if depth_error.numel() >= 2:
+                    depth_error, _ = torch.topk(depth_error, int(0.95 * depth_error.size(0)), largest=False)
+                    lidar_depth_loss = depth_error.mean()
+                    scalar_dict['lidar_depth_loss'] = lidar_depth_loss
+                    loss += optim_args.lambda_depth_lidar * lidar_depth_loss
 
             if optim_args.use_voxel_depth: # 仅background
                 depth_mask = (
@@ -544,12 +573,13 @@ def training():
                     & torch.isfinite(voxel_depth_tensor)
                     & (voxel_depth_tensor > 0.)
                 )
-                expected_depth = soft_render_pkg['depth'] / (soft_render_pkg['acc'] + 1e-10)  
-                depth_error = torch.abs((expected_depth[depth_mask] - voxel_depth_tensor[depth_mask[0]]))
-                depth_error, _ = torch.topk(depth_error, int(0.95 * depth_error.size(0)), largest=False)
-                voxel_depth_loss = depth_error.mean()
-                scalar_dict['lidar_depth_loss'] = voxel_depth_loss
-                loss += optim_args.lambda_depth_lidar * voxel_depth_loss
+                expected_depth = depth_render[depth_mask] / depth_acc[depth_mask]
+                depth_error = torch.abs(expected_depth - voxel_depth_tensor[depth_mask[0]])
+                if depth_error.numel() >= 2:
+                    depth_error, _ = torch.topk(depth_error, int(0.95 * depth_error.size(0)), largest=False)
+                    voxel_depth_loss = depth_error.mean()
+                    scalar_dict['voxel_depth_loss'] = voxel_depth_loss
+                    loss += optim_args.lambda_depth_lidar * voxel_depth_loss
 
         # color correction loss
         if optim_args.lambda_color_correction > 0 and gaussians.use_color_correction:
@@ -585,6 +615,7 @@ def training():
         if is_save_images and (iteration % 100 == 0):
             # row0: gt_image, image, depth
             # row1: acc, image_obj, acc_obj
+            # NOTE(depth): 此调试图显示原始 sum(w*z)，颜色变化同时受 acc 影响，不能直接用于判断几何深度是否正确。
             depth_colored, _ = visualize_depth_numpy(soft_render_pkg['depth'].detach().cpu().numpy().squeeze(0))
             depth_colored = depth_colored[..., [2, 1, 0]] / 255.
             depth_colored = torch.from_numpy(depth_colored).permute(2, 0, 1).float().cuda()
