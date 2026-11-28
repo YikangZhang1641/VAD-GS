@@ -185,7 +185,7 @@ class GaussianModelBkgd(GaussianModel):
 
         # Prune points below opacity
         prune_mask = (self.get_opacity < min_opacity).squeeze()
-        prune_mask = torch.logical_or(prune_mask, torch.all(self.get_scaling < 0.001, axis=1).squeeze())
+        prune_mask = torch.logical_or(prune_mask, torch.all(self.get_scaling < 0.01, axis=1).squeeze())
         self.scalar_dict['points_below_min_opacity'] = prune_mask.sum().item()
 
         # Prune big points in world space 

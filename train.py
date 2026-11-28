@@ -241,7 +241,19 @@ def training():
 
         background_mask = torch.all(dynamic_mask == 255, dim=0, keepdim=True) & ~sky_mask[0]
 
-        ###################### hard depth #######################
+
+
+        # ###################### Fake. For Debug #######################
+        # view_stack_iter = 0
+        # soft_render_pkg = gaussians_renderer.render(viewpoint_cam, gaussians)
+        # # 缓存下一轮需要的图像，CPU 存储且不保留训练计算图或逐高斯数据。
+        # render_cache[randidx] = {
+        #     key: soft_render_pkg[key].detach().to('cpu', copy=True)
+        #     for key in ('rgb', 'depth', 'normals', 'acc')}
+        # # 仅在独立缓存中归一化深度，供下一轮的检测、传播和深度误差比较使用。
+        # render_cache[randidx]['depth'] /= render_cache[randidx]['acc'].clamp_min(1e-6)
+        # # image, acc, viewspace_point_tensor, visibility_filter, radii = soft_render_pkg["rgb"], soft_render_pkg['acc'], soft_render_pkg["viewspace_points"], soft_render_pkg["visibility_filter"], soft_render_pkg["radii"]
+        ####################################################
         if view_stack_iter % optim_args.propagation_interval == 0 and iteration > optim_args.propagated_iteration_begin and iteration < optim_args.propagated_iteration_end and randidx in render_cache:
             soft_render_pkg = {key: value.to(gt_image.device) for key, value in render_cache[randidx].items()}
             image = soft_render_pkg["rgb"]
@@ -268,7 +280,7 @@ def training():
                 sample_x, sample_y = sample_x[selected_id], sample_y[selected_id]
             sample_background_np = background_mask_np[sample_y, sample_x]
             sample_background = torch.as_tensor(sample_background_np, device=image.device)
-            sample_dynamic_ids = dynamic_mask[:, sample_y, sample_x].detach().cpu().numpy()
+            # sample_dynamic_ids = dynamic_mask[:, sample_y, sample_x].detach().cpu().numpy()
             # -1 未知，0 未缺失，1 缺失；重叠 actor 的各自状态另外保存。
             sample_vacancy_state = torch.full((len(sample_x),), -1, dtype=torch.int8, device=image.device)
             actor_sample_states = {}
@@ -484,30 +496,40 @@ def training():
 
             # 3. Actor 分支：独立 acc 检测 → 共视帧选择 → reconstruct_actor。
             # 与背景 global/local 分支平级；只渲染当前 actor 自身的 Gaussian。
-            if np.any(sample_dynamic_ids != 255):
+            if torch.any(dynamic_mask != 255):
                 actor_previous_include = list(gaussians.include_list)
                 actor_previous_camera = gaussians.viewpoint_camera
                 with torch.no_grad():
                     try:
-                        for dynamic_id in np.unique(sample_dynamic_ids):
-                            dynamic_id = int(dynamic_id)
+                        for dynamic_id in torch.unique(dynamic_mask):
+                            dynamic_id = int(dynamic_id.item())
                             obj_name = f"obj_{dynamic_id:03d}"
                             if dynamic_id == 255 or obj_name not in gaussians.obj_list:
                                 continue
-                            actor_samples_np = np.any(sample_dynamic_ids == dynamic_id, axis=0)
-                            actor_samples = torch.as_tensor(actor_samples_np, device=image.device)
                             gaussians.set_visibility([obj_name])
                             gaussians.parse_camera(viewpoint_cam)
                             if obj_name not in gaussians.graph_obj_list:
                                 continue
+                            # 每个 actor 独立从有效 mask 内无放回采样，最多 32 点。
+                            actor_mask = torch.any(dynamic_mask == dynamic_id, dim=0) & ~sky_mask[0]
+                            actor_y, actor_x = actor_mask.nonzero(as_tuple=True)
+                            actor_mask_area = actor_x.numel()
+                            if actor_mask_area == 0:
+                                continue
+                            if actor_mask_area > 32:
+                                selected = torch.randperm(actor_mask_area, device=actor_x.device)[:32]
+                                actor_x, actor_y = actor_x[selected], actor_y[selected]
+                            # 按 mask 面积与全部采样点数确定半径，随补全进度缩小。
+                            actor_spacing = np.sqrt(actor_mask_area / actor_x.numel())
+                            actor_sample_radius = int(np.clip(round(actor_spacing * (1.0 - 0.5 * completion_progress)), 4, 32))
                             obj_render_pkg = gaussians_renderer.render_kernel(viewpoint_cam, gaussians)
-                            actor_acc = obj_render_pkg["acc"][0, sample_y[actor_samples_np], sample_x[actor_samples_np]]
+                            actor_acc = obj_render_pkg["acc"][0, actor_y, actor_x]
                             actor_states = (actor_acc < 0.5).to(torch.int8)
-                            actor_sample_states[dynamic_id] = (actor_samples_np, actor_states.cpu().numpy())
-                            # 一个像素可能属于多个 actor；合并图中任一 actor 缺失就标为缺失。
-                            sample_vacancy_state[actor_samples] = torch.maximum(sample_vacancy_state[actor_samples], actor_states)
-                            actor_missing = actor_states.cpu().numpy() == 1
-                            if actor_missing.sum() < 2 or actor_missing.mean() < 0.1 or optim_args.skip_view_selection:
+                            actor_x_np, actor_y_np = actor_x.cpu().numpy(), actor_y.cpu().numpy()
+                            actor_states_np = actor_states.cpu().numpy()
+                            actor_sample_states[dynamic_id] = (actor_x_np, actor_y_np, actor_states_np, actor_sample_radius)
+                            actor_missing = actor_states_np == 1
+                            if actor_missing.sum() < 1 or optim_args.skip_view_selection:
                                 continue
 
                             obj_model = getattr(gaussians, obj_name)
@@ -536,42 +558,41 @@ def training():
                                 continue
 
                             reconstruct_actor(ref_src_views, dynamic_id, viewpoint_cam, viewpoint_full_stack, dataset, gaussians, gaussians_renderer, 
-                                iteration, optim_args, gt_image, sky_mask, dynamic_mask, mono_normal, obj_render_pkg, sample_radius=sample_radius,
-                                missing_uv=np.column_stack((sample_x[actor_samples_np][actor_missing], sample_y[actor_samples_np][actor_missing]))
+                                iteration, optim_args, gt_image, sky_mask, dynamic_mask, mono_normal, obj_render_pkg, sample_radius=actor_sample_radius,
+                                missing_uv=np.column_stack((actor_x_np[actor_missing], actor_y_np[actor_missing]))
                             )
                     finally:
                         gaussians.set_visibility(actor_previous_include)
                         gaussians.parse_camera(actor_previous_camera)
 
-            # 4. 统一可视化：两个分支结束后绘制；纯背景视角也可使用。
-            # 圆圈为背景、方框为 actor；重叠 actor 分别绘制。
+            # # 4. 统一可视化：两个分支结束后绘制；纯背景视角也可使用。
+            # # 圆圈为背景、方框为 actor；重叠 actor 分别绘制。
             # fig, ax = plt.subplots(figsize=(14, 8))
             # ax.imshow(gt_image.detach().cpu().permute(1, 2, 0).clamp(0, 1).numpy())
             # debug_states = sample_vacancy_state.cpu().numpy()
-            # debug_groups = [('background', sample_background_np, debug_states[sample_background_np], 'o')]
-            # debug_groups += [(f'obj_{actor_id:03d}', selected, states, 's')
-            #                     for actor_id, (selected, states) in actor_sample_states.items()]
+            # debug_groups = [('background', sample_x[sample_background_np], sample_y[sample_background_np], debug_states[sample_background_np], 'o')]
+            # debug_groups += [(f'obj_{actor_id:03d} (r={radius})', xs, ys, states, 's')
+            #                     for actor_id, (xs, ys, states, radius) in actor_sample_states.items()]
             # # 红色半透明区域为 actor 缺失采样点的方形邻域，并裁剪到该 actor mask。
             # debug_actor_region = np.zeros((img_H, img_W), dtype=np.bool_)
-            # for actor_id, (selected, states) in actor_sample_states.items():
+            # for actor_id, (xs, ys, states, radius) in actor_sample_states.items():
             #     square_region = np.zeros_like(debug_actor_region)
-            #     for u, v in zip(sample_x[selected][states == 1], sample_y[selected][states == 1]):
-            #         square_region[max(0, v - sample_radius):min(img_H, v + sample_radius),
-            #                         max(0, u - sample_radius):min(img_W, u + sample_radius)] = True
-            #     debug_actor_region |= square_region & torch.any(dynamic_mask == actor_id, dim=0).cpu().numpy()
+            #     for u, v in zip(xs[states == 1], ys[states == 1]):
+            #         square_region[max(0, v - radius):min(img_H, v + radius),
+            #                         max(0, u - radius):min(img_W, u + radius)] = True
+            #     debug_actor_region |= square_region & torch.any(dynamic_mask == actor_id, dim=0).cpu().numpy() & ~sky_mask[0].cpu().numpy()
             # debug_overlay = np.zeros((img_H, img_W, 4))
             # debug_overlay[debug_actor_region] = [1., 0., 0., 0.2]
             # ax.imshow(debug_overlay)
             # # 缺失状态最后绘制，防止重叠 actor 的健康标记遮住缺失标记。
             # for state, label, color in [(-1, 'Unknown', 'yellow'), (0, 'Covered', 'lime'), (1, 'Missing', 'red')]:
-            #     for name, selected, states, marker in debug_groups:
-            #         xs, ys = sample_x[selected], sample_y[selected]
+            #     for name, xs, ys, states, marker in debug_groups:
             #         pick = states == state
             #         if pick.any():
             #             ax.scatter(xs[pick], ys[pick], marker=marker, s=55,
             #                         facecolors='none', edgecolors=color, linewidths=1.3,
             #                         label=f'{name} {label}: {pick.sum()}')
-            # ax.set_title(f'Vacancy | View {current_view} | Iteration {iteration} | radius {sample_radius}')
+            # ax.set_title(f'Vacancy | View {current_view} | Iteration {iteration} | background radius {sample_radius}')
             # ax.legend(fontsize=8)
             # ax.set_axis_off()
             # fig.tight_layout()
