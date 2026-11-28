@@ -3,6 +3,7 @@ parent_cfg: configs/example/nuscenes_train_000.yaml
 data:
   vggt_predictions: predictions.npz
   vggt_prediction_generation:
+    conda_env: playground
     vggt_root: /home/zyk/Ext/Projects/support/vggt-omega
     checkpoint: /home/zyk/Ext/Projects/support/vggt-omega/checkpoints/vggt_omega_1b_512.pt
     device: cuda

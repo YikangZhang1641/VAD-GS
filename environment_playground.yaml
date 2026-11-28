@@ -1,0 +1,17 @@
+# Offline VGGT-Omega inference; kept separate from the VAD-GS training environment.
+name: playground
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu118
+      - torch==2.7.0+cu118
+      - torchvision==0.22.0+cu118
+      - numpy==1.24.4
+      - Pillow==12.3.0
+      - opencv-python==4.10.0.84
+      - PyYAML==6.0.2
+      - einops==0.8.1
+      - safetensors==0.6.2
